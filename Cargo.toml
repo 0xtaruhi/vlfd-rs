@@ -1,0 +1,13 @@
+[package]
+name = "vlfd-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Modern Rust driver for the VLFD board"
+license = "Apache-2.0"
+keywords = ["usb", "fpga", "driver", "hardware", "vericomm"]
+categories = ["hardware-support", "embedded", "api-bindings"]
+documentation = "https://docs.rs/vlfd-rs"
+
+[dependencies]
+rusb = { version = "0.9", features = ["vendored"] }
