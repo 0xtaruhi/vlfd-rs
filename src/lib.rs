@@ -57,6 +57,7 @@ pub use config::Config;
 pub use device::{Device, IoSettings};
 pub use error::{Error, Result};
 pub use program::Programmer;
+pub use usb::{HotplugEvent, HotplugEventKind, HotplugOptions, HotplugRegistration};
 
 #[cfg(test)]
 mod tests {
