@@ -8,6 +8,7 @@
 - High-level configuration getters and setters with caching
 - Bitstream upload support for the integrated FPGA programmer
 - Hotplug callbacks powered by libusb's hotplug subsystem
+- Session/mode tracking so higher-level APIs can validate driver state
 
 ## Quick Start
 ```rust
@@ -19,9 +20,9 @@ fn main() -> Result<()> {
     let mut settings = IoSettings::default();
     device.enter_io_mode(&settings)?;
 
-    let mut tx = [0x1234u16; 4];
+    let tx = [0x1234u16; 4];
     let mut rx = [0u16; 4];
-    device.transfer_io(&mut tx, &mut rx)?;
+    device.transfer_io_words(&tx, &mut rx)?;
 
     device.exit_io_mode()?;
     Ok(())

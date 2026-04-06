@@ -1,9 +1,11 @@
+use crate::config::Config;
 use crate::device::Device;
 use crate::error::{Error, Result};
-use crate::usb::Endpoint;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::{
+    fs::File,
+    io::{BufRead, BufReader},
+    path::Path,
+};
 
 /// Helper that manages FPGA bitstream uploads using a [`Device`].
 pub struct Programmer {
@@ -37,13 +39,11 @@ impl Programmer {
 
         self.device.ensure_session()?;
         self.device.encrypt(&mut program_data);
-        self.device.activate_fpga_programmer()?;
+        self.device.activate_fpga_programmer_checked()?;
 
-        let fifo_words = usize::from(self.device.config().fifo_size()).saturating_mul(2);
-        let chunk_len = fifo_words.max(1);
-
+        let chunk_len = bitstream_chunk_words(self.device.config())?;
         for chunk in program_data.chunks(chunk_len) {
-            self.device.usb().write_words(Endpoint::FifoWrite, chunk)?;
+            self.device.fifo_write(chunk)?;
         }
 
         self.device.command_active()?;
@@ -59,36 +59,35 @@ impl Programmer {
 
 fn load_bitfile(path: &Path) -> Result<Vec<u16>> {
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    load_bitfile_from_reader(BufReader::new(file))
+}
+
+fn load_bitfile_from_reader<R: BufRead>(reader: R) -> Result<Vec<u16>> {
     let mut program_data = Vec::new();
 
-    for line in reader.lines() {
+    for (line_index, line) in reader.lines().enumerate() {
+        let line_number = line_index + 1;
         let line = line?;
-        let mut accumulator = 0u16;
-        let mut has_nibble = false;
+        let payload = line.split_whitespace().next().unwrap_or_default();
 
-        for byte in line.bytes() {
-            match byte {
-                b'_' => {
-                    program_data.push(accumulator);
-                    accumulator = 0;
-                    has_nibble = false;
-                }
-                b' ' | b'\t' => break,
-                _ => {
-                    let Some(nibble) = remap_hex(byte) else {
-                        return Err(Error::InvalidBitfile(
-                            "bitfile contains non-hexadecimal character",
-                        ));
-                    };
-                    accumulator = (accumulator << 4) | u16::from(nibble);
-                    has_nibble = true;
-                }
-            }
+        if payload.is_empty() {
+            continue;
         }
 
-        if has_nibble {
-            program_data.push(accumulator);
+        for segment in payload.split('_') {
+            if segment.is_empty() {
+                return Err(Error::InvalidBitfileLine {
+                    line: line_number,
+                    reason: "empty word segment",
+                });
+            }
+
+            let value =
+                u16::from_str_radix(segment, 16).map_err(|_| Error::InvalidBitfileLine {
+                    line: line_number,
+                    reason: "bitfile contains non-hexadecimal characters",
+                })?;
+            program_data.push(value);
         }
     }
 
@@ -99,11 +98,47 @@ fn load_bitfile(path: &Path) -> Result<Vec<u16>> {
     Ok(program_data)
 }
 
-fn remap_hex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
+fn bitstream_chunk_words(config: &Config) -> Result<usize> {
+    let fifo_words = usize::from(config.fifo_size_words());
+    if fifo_words == 0 {
+        return Err(Error::UnexpectedResponse(
+            "device reported zero-length programming FIFO",
+        ));
+    }
+    Ok(fifo_words)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bitstream_chunk_words, load_bitfile_from_reader};
+    use crate::{Config, Error};
+    use std::io::Cursor;
+
+    #[test]
+    fn parses_cpp_style_bitfile_lines_into_words() {
+        let data = "1234_abcd\n5678_9abc trailing\n";
+        let words = load_bitfile_from_reader(Cursor::new(data)).expect("parse should succeed");
+        assert_eq!(words, vec![0x1234, 0xabcd, 0x5678, 0x9abc]);
+    }
+
+    #[test]
+    fn reports_invalid_bitfile_line_numbers() {
+        let err =
+            load_bitfile_from_reader(Cursor::new("1234_gggg\n")).expect_err("parse should fail");
+        match err {
+            Error::InvalidBitfileLine { line, reason } => {
+                assert_eq!(line, 1);
+                assert_eq!(reason, "bitfile contains non-hexadecimal characters");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn programming_chunk_size_uses_fifo_word_count_directly() {
+        let mut words = [0u16; Config::WORD_COUNT];
+        words[33] = 512;
+        let config = Config::from_words(words);
+        assert_eq!(bitstream_chunk_words(&config).unwrap(), 512);
     }
 }

@@ -20,9 +20,9 @@
 //!     device.enter_io_mode(&settings)?;
 //!
 //!     // Perform a 4-word FIFO round-trip with transparent encryption.
-//!     let mut tx = [0x1234u16, 0x5678, 0x9abc, 0xdef0];
+//!     let tx = [0x1234u16, 0x5678, 0x9abc, 0xdef0];
 //!     let mut rx = [0u16; 4];
-//!     device.transfer_io(&mut tx, &mut rx)?;
+//!     device.transfer_io_words(&tx, &mut rx)?;
 //!
 //!     device.exit_io_mode()?;
 //!     Ok(())
@@ -54,7 +54,7 @@ mod program;
 mod usb;
 
 pub use config::Config;
-pub use device::{Device, IoSettings};
+pub use device::{Device, DeviceMode, IoSettings};
 pub use error::{Error, Result};
 pub use program::Programmer;
 pub use usb::{HotplugEvent, HotplugEventKind, HotplugOptions, HotplugRegistration};
@@ -67,6 +67,8 @@ mod tests {
     fn device_is_created_closed() {
         let device = Device::new().expect("failed to initialise USB context");
         assert!(!device.is_open());
+        assert!(!device.is_initialized());
+        assert_eq!(device.mode(), DeviceMode::Closed);
     }
 
     #[test]

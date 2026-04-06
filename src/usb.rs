@@ -11,6 +11,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(target_endian = "big")]
+compile_error!("vlfd-rs currently supports little-endian hosts only");
+
 const INTERFACE: u8 = 0;
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1_000);
 
@@ -100,9 +103,6 @@ impl UsbDevice {
             .open_device_with_vid_pid(vid, pid)
             .ok_or(Error::DeviceNotFound { vid, pid })?;
 
-        handle
-            .reset()
-            .map_err(|err| usb_error(err, "libusb_reset_device"))?;
         handle
             .claim_interface(INTERFACE)
             .map_err(|err| usb_error(err, "libusb_claim_interface"))?;
@@ -271,7 +271,7 @@ fn bulk_read<T: UsbContext>(
         let chunk = &mut buffer[offset..];
         let bytes_read = handle
             .read_bulk(endpoint as u8, chunk, DEFAULT_TIMEOUT)
-            .map_err(|err| usb_error(err, "libusb_bulk_transfer"))?;
+            .map_err(|err| usb_error(err, "libusb_bulk_read"))?;
 
         if bytes_read == 0 {
             return Err(Error::UnexpectedResponse("bulk read returned zero bytes"));
@@ -292,7 +292,7 @@ fn bulk_write<T: UsbContext>(
         let chunk = &buffer[offset..];
         let bytes_written = handle
             .write_bulk(endpoint as u8, chunk, DEFAULT_TIMEOUT)
-            .map_err(|err| usb_error(err, "libusb_bulk_transfer"))?;
+            .map_err(|err| usb_error(err, "libusb_bulk_write"))?;
 
         if bytes_written == 0 {
             return Err(Error::UnexpectedResponse("bulk write returned zero bytes"));
@@ -304,10 +304,16 @@ fn bulk_write<T: UsbContext>(
 }
 
 fn words_as_bytes(words: &[u16]) -> &[u8] {
+    // SAFETY: `u16` is a plain-old-data type, the slice is valid for reads, and
+    // the crate is restricted to little-endian hosts to match the device's
+    // wire format.
     unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, std::mem::size_of_val(words)) }
 }
 
 fn words_as_bytes_mut(words: &mut [u16]) -> &mut [u8] {
+    // SAFETY: `u16` is a plain-old-data type, the slice is valid for writes,
+    // and the crate is restricted to little-endian hosts to match the device's
+    // wire format.
     unsafe {
         std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, std::mem::size_of_val(words))
     }

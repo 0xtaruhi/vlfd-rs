@@ -10,8 +10,26 @@ pub enum Error {
         vid: u16,
         pid: u16,
     },
+    BufferTooLarge {
+        context: &'static str,
+        max_words: usize,
+        actual_words: usize,
+    },
     FeatureUnavailable(&'static str),
     InvalidBitfile(&'static str),
+    InvalidBitfileLine {
+        line: usize,
+        reason: &'static str,
+    },
+    InvalidBufferLength {
+        context: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    InvalidMode {
+        expected: &'static str,
+        actual: &'static str,
+    },
     NotProgrammed,
     Timeout(&'static str),
     UnexpectedResponse(&'static str),
@@ -33,8 +51,33 @@ impl fmt::Display for Error {
             Error::DeviceNotFound { vid, pid } => {
                 write!(f, "device {vid:#06x}:{pid:#06x} not found")
             }
+            Error::BufferTooLarge {
+                context,
+                max_words,
+                actual_words,
+            } => write!(
+                f,
+                "{context} exceeds FIFO capacity ({actual_words} words > {max_words} words)"
+            ),
             Error::FeatureUnavailable(feature) => write!(f, "feature `{feature}` is unavailable"),
             Error::InvalidBitfile(reason) => write!(f, "invalid bitfile: {reason}"),
+            Error::InvalidBitfileLine { line, reason } => {
+                write!(f, "invalid bitfile line {line}: {reason}")
+            }
+            Error::InvalidBufferLength {
+                context,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "invalid buffer length for `{context}` (expected {expected}, got {actual})"
+            ),
+            Error::InvalidMode { expected, actual } => {
+                write!(
+                    f,
+                    "invalid device mode (expected `{expected}`, got `{actual}`)"
+                )
+            }
             Error::NotProgrammed => write!(f, "FPGA is not programmed"),
             Error::Timeout(context) => write!(f, "operation `{context}` timed out"),
             Error::UnexpectedResponse(context) => {
