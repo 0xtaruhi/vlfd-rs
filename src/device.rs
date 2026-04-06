@@ -4,6 +4,7 @@ use crate::error::{Error, Result};
 use crate::usb::{
     Endpoint, HotplugEvent, HotplugOptions, HotplugRegistration, TransportConfig, UsbDevice,
 };
+use std::cell::Cell;
 use std::time::Instant;
 
 const CONTROL_COMMAND_PREFIX: u8 = 0x01;
@@ -18,7 +19,7 @@ pub struct Device {
     config: Config,
     encryption: EncryptionState,
     transfer_scratch: Vec<u16>,
-    session: SessionState,
+    session: Cell<SessionState>,
 }
 
 impl Device {
@@ -28,7 +29,7 @@ impl Device {
             config: Config::new(),
             encryption: EncryptionState::default(),
             transfer_scratch: Vec::new(),
-            session: SessionState::default(),
+            session: Cell::new(SessionState::default()),
         })
     }
 
@@ -38,7 +39,7 @@ impl Device {
             config: Config::new(),
             encryption: EncryptionState::default(),
             transfer_scratch: Vec::new(),
-            session: SessionState::default(),
+            session: Cell::new(SessionState::default()),
         })
     }
 
@@ -52,8 +53,18 @@ impl Device {
         Ok(device)
     }
 
+    /// Legacy escape hatch for direct low-level USB access.
+    pub fn usb(&self) -> &UsbDevice {
+        &self.usb
+    }
+
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Legacy direct mutable access to the cached configuration image.
+    pub fn config_mut(&mut self) -> &mut Config {
+        &mut self.config
     }
 
     pub fn update_cached_config<F>(&mut self, update: F)
@@ -72,11 +83,11 @@ impl Device {
     }
 
     pub fn is_initialized(&self) -> bool {
-        self.session.initialized
+        self.session.get().initialized
     }
 
     pub fn mode(&self) -> DeviceMode {
-        self.session.mode
+        self.session.get().mode
     }
 
     pub fn transport_config(&self) -> &TransportConfig {
@@ -118,9 +129,9 @@ impl Device {
         self.initialize_unchecked()
     }
 
-    pub fn reset_engine(&mut self) -> Result<()> {
+    pub fn reset_engine(&self) -> Result<()> {
         self.usb.write_bytes(Endpoint::Command, &[0x02])?;
-        self.reset_local_state(SessionState::opened());
+        self.session.set(SessionState::opened());
         Ok(())
     }
 
@@ -193,25 +204,6 @@ impl Device {
         Ok(())
     }
 
-    /// Performs a VeriComm FIFO round-trip using the caller's write buffer as
-    /// the transfer scratch space.
-    ///
-    /// This avoids the extra copy performed by [`Self::transfer_io_words`], but
-    /// it mutates `write_buffer` in place and leaves it encrypted afterwards.
-    pub fn transfer_io_in_place_fast(
-        &mut self,
-        write_buffer: &mut [u16],
-        read_buffer: &mut [u16],
-    ) -> Result<()> {
-        self.ensure_vericomm_transfer(write_buffer.len(), read_buffer.len())?;
-
-        self.encrypt(write_buffer);
-        self.fifo_write(write_buffer)?;
-        self.fifo_read(read_buffer)?;
-        self.decrypt(read_buffer);
-        Ok(())
-    }
-
     pub fn exit_io_mode(&mut self) -> Result<()> {
         if !self.is_open() {
             return Ok(());
@@ -241,7 +233,7 @@ impl Device {
         self.sync_delay_unchecked()
     }
 
-    pub fn command_active(&mut self) -> Result<()> {
+    pub fn command_active(&self) -> Result<()> {
         if !self.is_open() {
             return Err(Error::DeviceNotOpen);
         }
@@ -267,40 +259,40 @@ impl Device {
         self.activate_mode_raw(mode)
     }
 
-    pub fn activate_fpga_programmer(&mut self) -> Result<()> {
-        self.activate_mode(DeviceMode::FpgaProgrammer)
+    pub fn activate_fpga_programmer(&self) -> Result<()> {
+        self.activate_mode_raw(DeviceMode::FpgaProgrammer)
     }
 
-    pub fn activate_vericomm(&mut self) -> Result<()> {
-        self.activate_mode(DeviceMode::VeriComm)
+    pub fn activate_vericomm(&self) -> Result<()> {
+        self.activate_mode_raw(DeviceMode::VeriComm)
     }
 
-    pub fn activate_veri_instrument(&mut self) -> Result<()> {
-        self.activate_mode(DeviceMode::VeriInstrument)
+    pub fn activate_veri_instrument(&self) -> Result<()> {
+        self.activate_mode_raw(DeviceMode::VeriInstrument)
     }
 
-    pub fn activate_verilink(&mut self) -> Result<()> {
-        self.activate_mode(DeviceMode::VeriLink)
+    pub fn activate_verilink(&self) -> Result<()> {
+        self.activate_mode_raw(DeviceMode::VeriLink)
     }
 
-    pub fn activate_veri_soc(&mut self) -> Result<()> {
-        self.activate_mode(DeviceMode::VeriSoc)
+    pub fn activate_veri_soc(&self) -> Result<()> {
+        self.activate_mode_raw(DeviceMode::VeriSoc)
     }
 
-    pub fn activate_vericomm_pro(&mut self) -> Result<()> {
-        self.activate_mode(DeviceMode::VeriCommPro)
+    pub fn activate_vericomm_pro(&self) -> Result<()> {
+        self.activate_mode_raw(DeviceMode::VeriCommPro)
     }
 
-    pub fn activate_veri_sdk(&mut self) -> Result<()> {
-        self.activate_mode(DeviceMode::VeriSdk)
+    pub fn activate_veri_sdk(&self) -> Result<()> {
+        self.activate_mode_raw(DeviceMode::VeriSdk)
     }
 
-    pub fn activate_flash_read(&mut self) -> Result<()> {
-        self.activate_mode(DeviceMode::FlashRead)
+    pub fn activate_flash_read(&self) -> Result<()> {
+        self.activate_mode_raw(DeviceMode::FlashRead)
     }
 
-    pub fn activate_flash_write(&mut self) -> Result<()> {
-        self.activate_mode(DeviceMode::FlashWrite)
+    pub fn activate_flash_write(&self) -> Result<()> {
+        self.activate_mode_raw(DeviceMode::FlashWrite)
     }
 
     pub fn encrypt(&mut self, buffer: &mut [u16]) {
@@ -357,7 +349,7 @@ impl Device {
         self.config = Config::new();
         self.encryption = EncryptionState::default();
         self.transfer_scratch.clear();
-        self.session = session;
+        self.session.set(session);
     }
 
     fn sync_delay_unchecked(&self) -> Result<()> {
@@ -376,11 +368,12 @@ impl Device {
         Err(Error::Timeout("sync_delay"))
     }
 
-    fn command_active_unchecked(&mut self) -> Result<()> {
+    fn command_active_unchecked(&self) -> Result<()> {
         self.sync_delay_unchecked()?;
         self.usb
             .write_bytes(Endpoint::Command, &[CONTROL_COMMAND_PREFIX, 0x00])?;
-        self.session = self.session.with_mode(DeviceMode::Control);
+        self.session
+            .set(self.session.get().with_mode(DeviceMode::Control));
         Ok(())
     }
 
@@ -394,7 +387,8 @@ impl Device {
         self.command_active_unchecked()?;
         self.decrypt(&mut words);
         self.config = Config::from_words(words);
-        self.session = SessionState::initialized(DeviceMode::Control);
+        self.session
+            .set(SessionState::initialized(DeviceMode::Control));
         Ok(())
     }
 
@@ -406,18 +400,19 @@ impl Device {
             .write_bytes(Endpoint::Command, &[CONTROL_COMMAND_PREFIX, 0x11])?;
         self.usb.write_words(Endpoint::FifoWrite, &words)?;
         self.command_active_unchecked()?;
-        self.session = SessionState::initialized(DeviceMode::Control);
+        self.session
+            .set(SessionState::initialized(DeviceMode::Control));
         Ok(())
     }
 
-    fn activate_mode_raw(&mut self, mode: DeviceMode) -> Result<()> {
+    fn activate_mode_raw(&self, mode: DeviceMode) -> Result<()> {
         let Some(command) = mode.command_byte() else {
             return Err(Error::UnexpectedResponse("unsupported mode command"));
         };
         self.sync_delay_unchecked()?;
         self.usb
             .write_bytes(Endpoint::Command, &[CONTROL_COMMAND_PREFIX, command])?;
-        self.session = self.session.with_mode(mode);
+        self.session.set(self.session.get().with_mode(mode));
         Ok(())
     }
 
@@ -696,15 +691,6 @@ mod tests {
 
         assert_eq!(input, [0x1234, 0xabcd]);
         assert_eq!(encrypted, &[0x12cb, 0xabcd]);
-    }
-
-    #[test]
-    fn in_place_fast_path_mutates_the_caller_buffer() {
-        let mut encryption = EncryptionState::default();
-        encryption.table[0] = 0x00ff;
-        let mut input = [0x1234u16, 0xabcd];
-        encryption.encrypt_words(&mut input);
-        assert_eq!(input, [0x12cb, 0xabcd]);
     }
 
     #[test]

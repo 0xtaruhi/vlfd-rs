@@ -28,15 +28,8 @@ enum RunMode {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ApiMode {
-    Safe,
-    Fast,
-}
-
-#[derive(Debug, Clone, Copy)]
 struct Options {
     mode: RunMode,
-    api: ApiMode,
     iterations: usize,
     words: usize,
     clock_high_delay: u16,
@@ -48,7 +41,6 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             mode: RunMode::Cpu,
-            api: ApiMode::Safe,
             iterations: 100_000,
             words: 512,
             clock_high_delay: 11,
@@ -81,14 +73,6 @@ impl Options {
 
         while let Some(flag) = args.next() {
             match flag.as_str() {
-                "--api" => {
-                    let value = next_value(&mut args, "--api")?;
-                    options.api = match value.as_str() {
-                        "safe" => ApiMode::Safe,
-                        "fast" => ApiMode::Fast,
-                        _ => return Err(format!("unknown api `{value}`").into()),
-                    };
-                }
                 "--iterations" => {
                     options.iterations = next_value(&mut args, "--iterations")?.parse()?;
                 }
@@ -137,41 +121,24 @@ where
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  cargo run --example bench_transfer -- cpu [--api safe|fast] [--words N] [--iterations N]\n  cargo run --example bench_transfer -- device [--api safe|fast] [--words N] [--iterations N] [--clock-high N] [--clock-low N] [--usb-timeout-ms N] [--sync-timeout-ms N] [--reset-on-open] [--no-clear-halt]"
+        "Usage:\n  cargo run --example bench_transfer -- cpu [--words N] [--iterations N]\n  cargo run --example bench_transfer -- device [--words N] [--iterations N] [--clock-high N] [--clock-low N] [--usb-timeout-ms N] [--sync-timeout-ms N] [--reset-on-open] [--no-clear-halt]"
     );
 }
 
 fn run_cpu_bench(options: &Options) -> Result<(), Box<dyn Error>> {
     let template = vec![0x1234u16; options.words];
-    let mut fast = template.clone();
     let mut scratch = Vec::with_capacity(options.words);
     let key = [0x55aau16; 16];
 
     let started = Instant::now();
-    match options.api {
-        ApiMode::Safe => {
-            for _ in 0..options.iterations {
-                scratch.clear();
-                scratch.extend_from_slice(&template);
-                xor_words(&mut scratch, &key);
-            }
-        }
-        ApiMode::Fast => {
-            for _ in 0..options.iterations {
-                fast.copy_from_slice(&template);
-                xor_words(&mut fast, &key);
-            }
-        }
+    for _ in 0..options.iterations {
+        scratch.clear();
+        scratch.extend_from_slice(&template);
+        xor_words(&mut scratch, &key);
     }
     let elapsed = started.elapsed();
 
-    print_summary(
-        "cpu",
-        options.api,
-        options.words,
-        options.iterations,
-        elapsed,
-    );
+    print_summary("cpu", options.words, options.iterations, elapsed);
     Ok(())
 }
 
@@ -185,33 +152,16 @@ fn run_device_bench(options: &Options) -> Result<(), Box<dyn Error>> {
     device.enter_io_mode(&io)?;
 
     let template = vec![0x1234u16; options.words];
-    let mut tx_fast = template.clone();
     let mut rx = vec![0u16; options.words];
 
     let started = Instant::now();
-    match options.api {
-        ApiMode::Safe => {
-            for _ in 0..options.iterations {
-                device.transfer_io_words(&template, &mut rx)?;
-            }
-        }
-        ApiMode::Fast => {
-            for _ in 0..options.iterations {
-                tx_fast.copy_from_slice(&template);
-                device.transfer_io_in_place_fast(&mut tx_fast, &mut rx)?;
-            }
-        }
+    for _ in 0..options.iterations {
+        device.transfer_io_words(&template, &mut rx)?;
     }
     let elapsed = started.elapsed();
     device.exit_io_mode()?;
 
-    print_summary(
-        "device",
-        options.api,
-        options.words,
-        options.iterations,
-        elapsed,
-    );
+    print_summary("device", options.words, options.iterations, elapsed);
     println!(
         "clock_high_delay={} clock_low_delay={} usb_timeout_ms={} sync_timeout_ms={} reset_on_open={} clear_halt_on_open={}",
         options.clock_high_delay,
@@ -232,16 +182,12 @@ fn xor_words(buffer: &mut [u16], key: &[u16; 16]) {
     }
 }
 
-fn print_summary(mode: &str, api: ApiMode, words: usize, iterations: usize, elapsed: Duration) {
+fn print_summary(mode: &str, words: usize, iterations: usize, elapsed: Duration) {
     let seconds = elapsed.as_secs_f64();
     let transfers_per_sec = iterations as f64 / seconds.max(f64::MIN_POSITIVE);
     let words_per_sec = (iterations * words) as f64 / seconds.max(f64::MIN_POSITIVE);
-    let api = match api {
-        ApiMode::Safe => "safe",
-        ApiMode::Fast => "fast",
-    };
 
     println!(
-        "mode={mode} api={api} words={words} iterations={iterations} elapsed={elapsed:?} transfers_per_sec={transfers_per_sec:.3} words_per_sec={words_per_sec:.3}"
+        "mode={mode} words={words} iterations={iterations} elapsed={elapsed:?} transfers_per_sec={transfers_per_sec:.3} words_per_sec={words_per_sec:.3}"
     );
 }

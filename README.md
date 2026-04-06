@@ -10,7 +10,6 @@
 - Hotplug callbacks powered by libusb's hotplug subsystem
 - Session/mode tracking so higher-level APIs can validate driver state
 - Configurable transport knobs for timeout and open behavior tuning
-- Separate safe and fast VeriComm transfer APIs
 
 ## Quick Start
 ```rust
@@ -31,21 +30,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 ```
-
-If you want the zero-copy fast path, use:
-
-```rust
-# use vlfd_rs::{Device, IoSettings, Result};
-# fn demo(mut device: Device) -> Result<()> {
-let mut tx = [0x1234u16; 4];
-let mut rx = [0u16; 4];
-device.transfer_io_in_place_fast(&mut tx, &mut rx)?;
-# Ok(())
-# }
-```
-
-That API is faster because it avoids an internal copy, but it mutates `tx` in
-place and leaves it encrypted afterwards.
 
 ## Installation
 Add the crate to your `Cargo.toml`:
@@ -80,7 +64,7 @@ Two example harnesses are included:
 
 ```bash
 cargo run --example bench_transfer -- cpu --words 1024 --iterations 200000
-cargo run --example bench_transfer -- device --api fast --words 512 --iterations 1000
+cargo run --example bench_transfer -- device --words 512 --iterations 1000
 ```
 
 ## License
