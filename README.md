@@ -9,13 +9,16 @@
 - Bitstream upload support for the integrated FPGA programmer
 - Hotplug callbacks powered by libusb's hotplug subsystem
 - Session/mode tracking so higher-level APIs can validate driver state
+- Configurable transport knobs for timeout and open behavior tuning
+- Separate safe and fast VeriComm transfer APIs
 
 ## Quick Start
 ```rust
-use vlfd_rs::{Device, IoSettings, Result};
+use vlfd_rs::{Device, IoSettings, Result, TransportConfig};
 
 fn main() -> Result<()> {
-    let mut device = Device::connect()?;
+    let transport = TransportConfig::default();
+    let mut device = Device::connect_with_transport_config(transport)?;
 
     let mut settings = IoSettings::default();
     device.enter_io_mode(&settings)?;
@@ -28,6 +31,21 @@ fn main() -> Result<()> {
     Ok(())
 }
 ```
+
+If you want the zero-copy fast path, use:
+
+```rust
+# use vlfd_rs::{Device, IoSettings, Result};
+# fn demo(mut device: Device) -> Result<()> {
+let mut tx = [0x1234u16; 4];
+let mut rx = [0u16; 4];
+device.transfer_io_in_place_fast(&mut tx, &mut rx)?;
+# Ok(())
+# }
+```
+
+That API is faster because it avoids an internal copy, but it mutates `tx` in
+place and leaves it encrypted afterwards.
 
 ## Installation
 Add the crate to your `Cargo.toml`:
@@ -42,7 +60,7 @@ use vlfd_rs::{Device, HotplugEventKind, HotplugOptions};
 
 fn main() -> vlfd_rs::Result<()> {
     let device = Device::new()?;
-    let _registration = device.usb().register_hotplug_callback(
+    let _registration = device.register_hotplug_callback(
         HotplugOptions::default(),
         |event| match event.kind {
             HotplugEventKind::Arrived => println!("Device arrived: {:?}", event.device),
@@ -54,6 +72,15 @@ fn main() -> vlfd_rs::Result<()> {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
+```
+
+## Benchmarking
+
+Two example harnesses are included:
+
+```bash
+cargo run --example bench_transfer -- cpu --words 1024 --iterations 200000
+cargo run --example bench_transfer -- device --api fast --words 512 --iterations 1000
 ```
 
 ## License

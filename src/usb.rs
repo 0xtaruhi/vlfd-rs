@@ -15,7 +15,26 @@ use std::{
 compile_error!("vlfd-rs currently supports little-endian hosts only");
 
 const INTERFACE: u8 = 0;
-const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1_000);
+const HOTPLUG_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportConfig {
+    pub usb_timeout: Duration,
+    pub sync_timeout: Duration,
+    pub reset_on_open: bool,
+    pub clear_halt_on_open: bool,
+}
+
+impl Default for TransportConfig {
+    fn default() -> Self {
+        Self {
+            usb_timeout: Duration::from_millis(1_000),
+            sync_timeout: Duration::from_secs(1),
+            reset_on_open: false,
+            clear_halt_on_open: true,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum Endpoint {
@@ -78,19 +97,33 @@ pub struct HotplugOptions {
 pub struct UsbDevice {
     context: Context,
     handle: Option<DeviceHandle<Context>>,
+    transport: TransportConfig,
 }
 
 impl UsbDevice {
     pub fn new() -> Result<Self> {
+        Self::with_transport_config(TransportConfig::default())
+    }
+
+    pub fn with_transport_config(transport: TransportConfig) -> Result<Self> {
         let context = Context::new().map_err(|err| usb_error(err, "libusb_init"))?;
         Ok(Self {
             context,
             handle: None,
+            transport,
         })
     }
 
     pub fn is_open(&self) -> bool {
         self.handle.is_some()
+    }
+
+    pub fn transport_config(&self) -> &TransportConfig {
+        &self.transport
+    }
+
+    pub fn set_transport_config(&mut self, transport: TransportConfig) {
+        self.transport = transport;
     }
 
     pub fn open(&mut self, vid: u16, pid: u16) -> Result<()> {
@@ -103,19 +136,27 @@ impl UsbDevice {
             .open_device_with_vid_pid(vid, pid)
             .ok_or(Error::DeviceNotFound { vid, pid })?;
 
+        if self.transport.reset_on_open {
+            handle
+                .reset()
+                .map_err(|err| usb_error(err, "libusb_reset_device"))?;
+        }
+
         handle
             .claim_interface(INTERFACE)
             .map_err(|err| usb_error(err, "libusb_claim_interface"))?;
 
-        for endpoint in [
-            Endpoint::FifoWrite,
-            Endpoint::Command,
-            Endpoint::FifoRead,
-            Endpoint::Sync,
-        ] {
-            handle
-                .clear_halt(endpoint as u8)
-                .map_err(|err| usb_error(err, "libusb_clear_halt"))?;
+        if self.transport.clear_halt_on_open {
+            for endpoint in [
+                Endpoint::FifoWrite,
+                Endpoint::Command,
+                Endpoint::FifoRead,
+                Endpoint::Sync,
+            ] {
+                handle
+                    .clear_halt(endpoint as u8)
+                    .map_err(|err| usb_error(err, "libusb_clear_halt"))?;
+            }
         }
 
         self.handle = Some(handle);
@@ -134,7 +175,7 @@ impl UsbDevice {
 
     pub fn read_bytes(&self, endpoint: Endpoint, buffer: &mut [u8]) -> Result<()> {
         let handle = self.handle.as_ref().ok_or(Error::DeviceNotOpen)?;
-        bulk_read(handle, endpoint, buffer)
+        bulk_read(handle, endpoint, buffer, self.transport.usb_timeout)
     }
 
     pub fn read_words(&self, endpoint: Endpoint, buffer: &mut [u16]) -> Result<()> {
@@ -144,7 +185,7 @@ impl UsbDevice {
 
     pub fn write_bytes(&self, endpoint: Endpoint, buffer: &[u8]) -> Result<()> {
         let handle = self.handle.as_ref().ok_or(Error::DeviceNotOpen)?;
-        bulk_write(handle, endpoint, buffer)
+        bulk_write(handle, endpoint, buffer, self.transport.usb_timeout)
     }
 
     pub fn write_words(&self, endpoint: Endpoint, buffer: &[u16]) -> Result<()> {
@@ -177,7 +218,6 @@ impl UsbDevice {
         builder.enumerate(options.enumerate);
 
         let handler = CallbackHotplug { callback };
-
         let registration = builder
             .register(&self.context, Box::new(handler))
             .map_err(|err| usb_error(err, "libusb_hotplug_register_callback"))?;
@@ -208,7 +248,7 @@ impl HotplugRegistration {
             .name("vlfd-usb-hotplug".into())
             .spawn(move || {
                 while thread_running.load(Ordering::Relaxed) {
-                    match context.handle_events(Some(Duration::from_millis(100))) {
+                    match context.handle_events(Some(HOTPLUG_POLL_INTERVAL)) {
                         Ok(_) => {}
                         Err(rusb::Error::Interrupted) | Err(rusb::Error::Timeout) => continue,
                         Err(_) => break,
@@ -265,12 +305,13 @@ fn bulk_read<T: UsbContext>(
     handle: &DeviceHandle<T>,
     endpoint: Endpoint,
     buffer: &mut [u8],
+    timeout: Duration,
 ) -> Result<()> {
     let mut offset = 0;
     while offset < buffer.len() {
         let chunk = &mut buffer[offset..];
         let bytes_read = handle
-            .read_bulk(endpoint as u8, chunk, DEFAULT_TIMEOUT)
+            .read_bulk(endpoint as u8, chunk, timeout)
             .map_err(|err| usb_error(err, "libusb_bulk_read"))?;
 
         if bytes_read == 0 {
@@ -286,12 +327,13 @@ fn bulk_write<T: UsbContext>(
     handle: &DeviceHandle<T>,
     endpoint: Endpoint,
     buffer: &[u8],
+    timeout: Duration,
 ) -> Result<()> {
     let mut offset = 0;
     while offset < buffer.len() {
         let chunk = &buffer[offset..];
         let bytes_written = handle
-            .write_bulk(endpoint as u8, chunk, DEFAULT_TIMEOUT)
+            .write_bulk(endpoint as u8, chunk, timeout)
             .map_err(|err| usb_error(err, "libusb_bulk_write"))?;
 
         if bytes_written == 0 {
@@ -323,5 +365,20 @@ fn usb_error(err: rusb::Error, context: &'static str) -> Error {
     Error::Usb {
         source: err,
         context,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TransportConfig;
+    use std::time::Duration;
+
+    #[test]
+    fn default_transport_config_prefers_stable_open_behavior() {
+        let config = TransportConfig::default();
+        assert_eq!(config.usb_timeout, Duration::from_millis(1_000));
+        assert_eq!(config.sync_timeout, Duration::from_secs(1));
+        assert!(!config.reset_on_open);
+        assert!(config.clear_halt_on_open);
     }
 }

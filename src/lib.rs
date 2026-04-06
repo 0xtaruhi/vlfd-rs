@@ -7,11 +7,12 @@
 //! transaction:
 //!
 //! ```no_run
-//! use vlfd_rs::{Device, IoSettings, Result};
+//! use vlfd_rs::{Device, IoSettings, Result, TransportConfig};
 //!
 //! fn main() -> Result<()> {
 //!     // Establish a connection and load the remote configuration/encryption tables.
-//!     let mut device = Device::connect()?;
+//!     let transport = TransportConfig::default();
+//!     let mut device = Device::connect_with_transport_config(transport)?;
 //!
 //!     // Override default VeriComm timing before entering I/O mode.
 //!     let mut settings = IoSettings::default();
@@ -57,7 +58,9 @@ pub use config::Config;
 pub use device::{Device, DeviceMode, IoSettings};
 pub use error::{Error, Result};
 pub use program::Programmer;
-pub use usb::{HotplugEvent, HotplugEventKind, HotplugOptions, HotplugRegistration};
+pub use usb::{
+    HotplugEvent, HotplugEventKind, HotplugOptions, HotplugRegistration, TransportConfig,
+};
 
 #[cfg(test)]
 mod tests {
@@ -74,7 +77,7 @@ mod tests {
     #[test]
     fn config_mutation_roundtrip() {
         let mut device = Device::new().expect("failed to initialise USB context");
-        device.config_mut().set_vericomm_clock_high_delay(42);
+        device.update_cached_config(|config| config.set_vericomm_clock_high_delay(42));
         assert_eq!(device.config().vericomm_clock_high_delay(), 42);
     }
 

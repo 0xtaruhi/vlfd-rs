@@ -46,10 +46,6 @@ impl Config {
         &self.words
     }
 
-    pub fn words_mut(&mut self) -> &mut [u16; Self::WORD_COUNT] {
-        &mut self.words
-    }
-
     pub fn vericomm_clock_high_delay(&self) -> u16 {
         self.words[word::VERICOMM_CLOCK_HIGH_DELAY]
     }

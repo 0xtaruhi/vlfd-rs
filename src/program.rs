@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::device::Device;
 use crate::error::{Error, Result};
+use crate::usb::TransportConfig;
 use std::{
     fs::File,
     io::{BufRead, BufReader},
@@ -18,7 +19,11 @@ impl Programmer {
     }
 
     pub fn connect() -> Result<Self> {
-        let device = Device::connect()?;
+        Self::connect_with_transport_config(TransportConfig::default())
+    }
+
+    pub fn connect_with_transport_config(transport: TransportConfig) -> Result<Self> {
+        let device = Device::connect_with_transport_config(transport)?;
         Ok(Self { device })
     }
 
