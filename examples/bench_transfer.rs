@@ -32,6 +32,7 @@ struct Options {
     mode: RunMode,
     iterations: usize,
     words: usize,
+    window: usize,
     clock_high_delay: u16,
     clock_low_delay: u16,
     transport: TransportConfig,
@@ -43,6 +44,7 @@ impl Default for Options {
             mode: RunMode::Cpu,
             iterations: 100_000,
             words: 512,
+            window: 16,
             clock_high_delay: 11,
             clock_low_delay: 11,
             transport: TransportConfig::default(),
@@ -77,6 +79,7 @@ impl Options {
                     options.iterations = next_value(&mut args, "--iterations")?.parse()?
                 }
                 "--words" => options.words = next_value(&mut args, "--words")?.parse()?,
+                "--window" => options.window = next_value(&mut args, "--window")?.parse()?,
                 "--clock-high" => {
                     options.clock_high_delay = next_value(&mut args, "--clock-high")?.parse()?
                 }
@@ -115,7 +118,7 @@ where
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  cargo run --example bench_transfer -- cpu [--words N] [--iterations N]\n  cargo run --example bench_transfer -- device [--words N] [--iterations N] [--clock-high N] [--clock-low N] [--usb-timeout-ms N] [--sync-timeout-ms N] [--reset-on-open] [--no-clear-halt]"
+        "Usage:\n  cargo run --example bench_transfer -- cpu [--words N] [--iterations N]\n  cargo run --example bench_transfer -- device [--words N] [--iterations N] [--window N] [--clock-high N] [--clock-low N] [--usb-timeout-ms N] [--sync-timeout-ms N] [--reset-on-open] [--no-clear-halt]"
     );
 }
 
@@ -144,12 +147,35 @@ fn run_device_bench(options: &Options) -> Result<(), Box<dyn Error>> {
         ..IoConfig::default()
     })?;
 
+    if options.window == 0 {
+        return Err("window must be at least 1".into());
+    }
+
     let template = vec![0x1234u16; options.words];
     let mut rx = vec![0u16; options.words];
+    let templates = vec![template.clone(); options.window];
+    let mut outputs = vec![vec![0u16; options.words]; options.window];
 
     let started = Instant::now();
-    for _ in 0..options.iterations {
-        io.transfer(&template, &mut rx)?;
+    if options.window == 1 {
+        for _ in 0..options.iterations {
+            io.transfer(&template, &mut rx)?;
+        }
+    } else {
+        let mut completed = 0usize;
+        while completed < options.iterations {
+            let batch_len = (options.iterations - completed).min(options.window);
+            let tx_refs = templates[..batch_len]
+                .iter()
+                .map(Vec::as_slice)
+                .collect::<Vec<_>>();
+            let mut rx_refs = outputs[..batch_len]
+                .iter_mut()
+                .map(Vec::as_mut_slice)
+                .collect::<Vec<_>>();
+            io.transfer_batch_into(&tx_refs, &mut rx_refs)?;
+            completed += batch_len;
+        }
     }
     let elapsed = started.elapsed();
     io.finish()?;

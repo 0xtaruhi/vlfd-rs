@@ -4,19 +4,18 @@ use crate::error::{Error, Result};
 use crate::usb::{Endpoint, TransportConfig, UsbDevice};
 use nusb::{
     Endpoint as UsbEndpoint,
-    io::{EndpointRead, EndpointWrite},
-    transfer::{Buffer, Bulk, In, Out},
+    transfer::{Buffer, Bulk, Completion, EndpointDirection, In, Out},
 };
-use std::io::{Read, Write};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const CONTROL_COMMAND_PREFIX: u8 = 0x01;
+const VERICOMM_TRANSFER_PACKET_BYTES: usize = 8;
+const MAX_PIPELINE_DEPTH: usize = 512;
 
 pub struct Board {
     usb: UsbDevice,
     config: Config,
     crypto: CryptoState,
-    transfer_scratch: Vec<u16>,
     initialized: bool,
     mode: BoardMode,
 }
@@ -34,7 +33,6 @@ impl Board {
             usb,
             config: Config::new(),
             crypto: CryptoState::default(),
-            transfer_scratch: Vec::new(),
             initialized: false,
             mode: BoardMode::Unknown,
         };
@@ -124,20 +122,15 @@ impl Board {
         self.write_config()?;
         self.activate_mode(BoardMode::VeriComm)?;
 
-        let fifo_write = self.usb.open_out_writer(Endpoint::FifoWrite)?;
-        let fifo_read = self.usb.open_in_reader(Endpoint::FifoRead)?;
-
-        let pipeline_write = self.usb.open_out_endpoint(Endpoint::FifoWrite)?;
-        let pipeline_read = self.usb.open_in_endpoint(Endpoint::FifoRead)?;
-
         Ok(IoSession {
             board: self,
-            fifo_write,
-            fifo_read,
-            pipeline_write,
-            pipeline_read,
+            pipeline_write: None,
+            pipeline_read: None,
+            single_tx_buffer: None,
+            single_rx_buffer: None,
             tx_pool: Vec::new(),
             rx_pool: Vec::new(),
+            finished: false,
         })
     }
 
@@ -226,22 +219,82 @@ impl Board {
 
 pub struct IoSession<'a> {
     board: &'a mut Board,
-    fifo_write: EndpointWrite<Bulk>,
-    fifo_read: EndpointRead<Bulk>,
-    pipeline_write: UsbEndpoint<Bulk, Out>,
-    pipeline_read: UsbEndpoint<Bulk, In>,
+    pipeline_write: Option<UsbEndpoint<Bulk, Out>>,
+    pipeline_read: Option<UsbEndpoint<Bulk, In>>,
+    single_tx_buffer: Option<Buffer>,
+    single_rx_buffer: Option<Buffer>,
     tx_pool: Vec<Buffer>,
     rx_pool: Vec<Buffer>,
+    finished: bool,
 }
 
 impl IoSession<'_> {
+    fn cleanup(&mut self) -> Result<()> {
+        if let Some(pipeline_write) = self.pipeline_write.as_mut() {
+            pipeline_write.cancel_all();
+        }
+        if let Some(pipeline_read) = self.pipeline_read.as_mut() {
+            pipeline_read.cancel_all();
+        }
+        self.board.activate_control()
+    }
+
+    fn ensure_pipeline_endpoints(&mut self) -> Result<()> {
+        if self.pipeline_write.is_none() {
+            self.pipeline_write = Some(self.board.usb.open_out_endpoint(Endpoint::FifoWrite)?);
+        }
+        if self.pipeline_read.is_none() {
+            self.pipeline_read = Some(self.board.usb.open_in_endpoint(Endpoint::FifoRead)?);
+        }
+        Ok(())
+    }
+
+    fn take_single_tx_buffer(&mut self, tx_bytes: usize) -> Buffer {
+        if let Some(mut buffer) = self.single_tx_buffer.take() {
+            if buffer.capacity() >= tx_bytes.max(1) {
+                buffer.clear();
+                return buffer;
+            }
+        }
+
+        self.pipeline_write
+            .as_mut()
+            .expect("pipeline write endpoint should be initialized")
+            .allocate(tx_bytes.max(1))
+    }
+
+    fn take_single_rx_buffer(&mut self, request_bytes: usize) -> Buffer {
+        if let Some(mut buffer) = self.single_rx_buffer.take() {
+            if buffer.capacity() >= request_bytes.max(1) {
+                buffer.clear();
+                buffer.set_requested_len(request_bytes.max(1));
+                return buffer;
+            }
+        }
+
+        let mut buffer = self
+            .pipeline_read
+            .as_mut()
+            .expect("pipeline read endpoint should be initialized")
+            .allocate(request_bytes.max(1));
+        buffer.set_requested_len(request_bytes.max(1));
+        buffer
+    }
+
     fn prepare_pools(&mut self, pipeline_depth: usize, tx_bytes: usize, rx_bytes: usize) {
+        let pipeline_write = self
+            .pipeline_write
+            .as_mut()
+            .expect("pipeline write endpoint should be initialized");
+        let pipeline_read = self
+            .pipeline_read
+            .as_mut()
+            .expect("pipeline read endpoint should be initialized");
         while self.tx_pool.len() < pipeline_depth {
-            self.tx_pool
-                .push(self.pipeline_write.allocate(tx_bytes.max(1)));
+            self.tx_pool.push(pipeline_write.allocate(tx_bytes.max(1)));
         }
         while self.rx_pool.len() < pipeline_depth {
-            let mut buffer = self.pipeline_read.allocate(rx_bytes.max(1));
+            let mut buffer = pipeline_read.allocate(rx_bytes.max(1));
             buffer.set_requested_len(rx_bytes.max(1));
             self.rx_pool.push(buffer);
         }
@@ -253,27 +306,99 @@ impl IoSession<'_> {
             usize::from(self.board.config.fifo_size_words()),
         )?;
         self.board.ensure_mode(BoardMode::VeriComm)?;
+        self.ensure_pipeline_endpoints()?;
 
-        self.board.transfer_scratch.clear();
-        self.board.transfer_scratch.extend_from_slice(tx);
+        let tx_byte_len = std::mem::size_of_val(tx);
+        let request_bytes = aligned_request_len(
+            self.pipeline_read
+                .as_ref()
+                .expect("pipeline read endpoint should be initialized")
+                .max_packet_size(),
+            tx_byte_len,
+        );
+
+        let rx_buffer = self.take_single_rx_buffer(request_bytes);
+        submit_pipeline_read(
+            self.pipeline_read
+                .as_mut()
+                .expect("pipeline read endpoint should be initialized"),
+            rx_buffer,
+            request_bytes,
+        );
+
+        let mut tx_buffer = self.take_single_tx_buffer(tx_byte_len);
+        let tx_bytes = tx_buffer.extend_fill(tx_byte_len, 0);
+        words_to_bytes(tx, tx_bytes);
         self.board
             .crypto
-            .encrypt_words(&mut self.board.transfer_scratch);
+            .encrypt_words(bytes_as_words_mut(tx_bytes));
+        self.pipeline_write
+            .as_mut()
+            .expect("pipeline write endpoint should be initialized")
+            .submit(tx_buffer);
 
-        let tx_bytes = words_as_bytes(&self.board.transfer_scratch);
-        let rx_bytes = words_as_bytes_mut(rx);
+        let timeout = self.board.transport().usb_timeout;
+        let tx_completion = match self
+            .pipeline_write
+            .as_mut()
+            .expect("pipeline write endpoint should be initialized")
+            .wait_next_complete(timeout)
+        {
+            Some(completion) => completion,
+            None => {
+                let tx_cancelled = cancel_pending_transfer(
+                    self.pipeline_write
+                        .as_mut()
+                        .expect("pipeline write endpoint should be initialized"),
+                );
+                self.single_tx_buffer = Some(tx_cancelled.buffer);
+                let rx_cancelled = cancel_pending_transfer(
+                    self.pipeline_read
+                        .as_mut()
+                        .expect("pipeline read endpoint should be initialized"),
+                );
+                self.single_rx_buffer = Some(rx_cancelled.buffer);
+                return Err(Error::Timeout("nusb_bulk_write"));
+            }
+        };
+        let tx_status = tx_completion.status;
+        let tx_buffer = tx_completion.buffer;
+        self.single_tx_buffer = Some(tx_buffer);
+        tx_status.map_err(|err| transfer_error(err, "nusb_bulk_write"))?;
 
-        self.fifo_write
-            .write_all(tx_bytes)
-            .map_err(|err| io_error(err, "nusb_bulk_write"))?;
-        self.fifo_write
-            .flush()
-            .map_err(|err| io_error(err, "nusb_bulk_flush"))?;
-        self.fifo_read
-            .read_exact(rx_bytes)
-            .map_err(|err| io_error(err, "nusb_bulk_read"))?;
+        let rx_completion = match self
+            .pipeline_read
+            .as_mut()
+            .expect("pipeline read endpoint should be initialized")
+            .wait_next_complete(timeout)
+        {
+            Some(completion) => completion,
+            None => {
+                let rx_cancelled = cancel_pending_transfer(
+                    self.pipeline_read
+                        .as_mut()
+                        .expect("pipeline read endpoint should be initialized"),
+                );
+                self.single_rx_buffer = Some(rx_cancelled.buffer);
+                return Err(Error::Timeout("nusb_bulk_read"));
+            }
+        };
+        let actual_len = rx_completion.actual_len;
+        let rx_status = rx_completion.status;
+        let mut rx_buffer = rx_completion.buffer;
+        rx_status.map_err(|err| transfer_error(err, "nusb_bulk_read"))?;
 
-        self.board.crypto.decrypt_words(rx);
+        if actual_len < tx_byte_len {
+            self.single_rx_buffer = Some(rx_buffer);
+            return Err(Error::UnexpectedResponse(
+                "blocking read returned short payload",
+            ));
+        }
+        self.board
+            .crypto
+            .decrypt_words(bytes_as_words_mut(&mut rx_buffer[..tx_byte_len]));
+        rx.copy_from_slice(bytes_as_words(&rx_buffer[..tx_byte_len]));
+        self.single_rx_buffer = Some(rx_buffer);
         Ok(())
     }
 
@@ -303,13 +428,21 @@ impl IoSession<'_> {
             return Ok(Vec::new());
         }
 
+        self.ensure_pipeline_endpoints()?;
+
         let max_bytes = txs
             .iter()
             .map(|tx| std::mem::size_of_val(*tx))
             .max()
             .unwrap_or(0);
-        let request_bytes = aligned_request_len(self.pipeline_read.max_packet_size(), max_bytes);
-        let pipeline_depth = txs.len().min(4);
+        let request_bytes = aligned_request_len(
+            self.pipeline_read
+                .as_ref()
+                .expect("pipeline read endpoint should be initialized")
+                .max_packet_size(),
+            max_bytes,
+        );
+        let pipeline_depth = txs.len().min(MAX_PIPELINE_DEPTH);
         self.prepare_pools(pipeline_depth, max_bytes, request_bytes);
         let mut outputs = rx_lengths
             .iter()
@@ -324,42 +457,55 @@ impl IoSession<'_> {
             let rx_buffer = self.rx_pool.pop().expect("rx pool should be primed");
             submit_pipeline_write(
                 &mut self.board.crypto,
-                &mut self.pipeline_write,
+                self.pipeline_write
+                    .as_mut()
+                    .expect("pipeline write endpoint should be initialized"),
                 txs[submitted],
                 tx_buffer,
             );
-            submit_pipeline_read(&mut self.pipeline_read, rx_buffer, request_bytes);
+            submit_pipeline_read(
+                self.pipeline_read
+                    .as_mut()
+                    .expect("pipeline read endpoint should be initialized"),
+                rx_buffer,
+                request_bytes,
+            );
             submitted += 1;
         }
 
         while completed < txs.len() {
             let write_completion = self
                 .pipeline_write
+                .as_mut()
+                .expect("pipeline write endpoint should be initialized")
                 .wait_next_complete(self.board.transport().usb_timeout)
                 .ok_or(Error::Timeout("pipeline_write"))?;
             write_completion
                 .status
                 .map_err(|err| transfer_error(err, "pipeline_write"))?;
+            self.tx_pool.push(write_completion.buffer);
 
             let read_completion = self
                 .pipeline_read
+                .as_mut()
+                .expect("pipeline read endpoint should be initialized")
                 .wait_next_complete(self.board.transport().usb_timeout)
                 .ok_or(Error::Timeout("pipeline_read"))?;
             read_completion
                 .status
                 .map_err(|err| transfer_error(err, "pipeline_read"))?;
+            let actual_len = read_completion.actual_len;
+            let read_buffer = read_completion.buffer;
 
             let expected_bytes = outputs[completed].len() * std::mem::size_of::<u16>();
-            if read_completion.actual_len < expected_bytes {
+            if actual_len < expected_bytes {
                 return Err(Error::UnexpectedResponse(
                     "pipeline read returned short payload",
                 ));
             }
-            bytes_into_words(
-                &read_completion.buffer[..expected_bytes],
-                &mut outputs[completed],
-            );
+            bytes_into_words(&read_buffer[..expected_bytes], &mut outputs[completed]);
             self.board.crypto.decrypt_words(&mut outputs[completed]);
+            self.rx_pool.push(read_buffer);
             completed += 1;
 
             if submitted < txs.len() {
@@ -373,11 +519,19 @@ impl IoSession<'_> {
                     .expect("rx pool should contain recycled buffers");
                 submit_pipeline_write(
                     &mut self.board.crypto,
-                    &mut self.pipeline_write,
+                    self.pipeline_write
+                        .as_mut()
+                        .expect("pipeline write endpoint should be initialized"),
                     txs[submitted],
                     tx_buffer,
                 );
-                submit_pipeline_read(&mut self.pipeline_read, rx_buffer, request_bytes);
+                submit_pipeline_read(
+                    self.pipeline_read
+                        .as_mut()
+                        .expect("pipeline read endpoint should be initialized"),
+                    rx_buffer,
+                    request_bytes,
+                );
                 submitted += 1;
             }
         }
@@ -417,9 +571,17 @@ impl IoSession<'_> {
     }
 
     pub fn finish(mut self) -> Result<()> {
-        self.pipeline_write.cancel_all();
-        self.pipeline_read.cancel_all();
-        self.board.activate_control()
+        let result = self.cleanup();
+        self.finished = true;
+        result
+    }
+}
+
+impl Drop for IoSession<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.cleanup();
+        }
     }
 }
 
@@ -590,6 +752,16 @@ fn validate_transfer_buffers(
         });
     }
 
+    let write_bytes = write_words * std::mem::size_of::<u16>();
+    if write_bytes % VERICOMM_TRANSFER_PACKET_BYTES != 0 {
+        return Err(Error::InvalidBufferLength {
+            context: "vericomm transfer packet alignment",
+            expected: write_words
+                .next_multiple_of(VERICOMM_TRANSFER_PACKET_BYTES / std::mem::size_of::<u16>()),
+            actual: write_words,
+        });
+    }
+
     Ok(())
 }
 
@@ -603,29 +775,10 @@ pub(crate) fn bitstream_chunk_words(config: &Config) -> Result<usize> {
     Ok(fifo_words)
 }
 
-fn words_as_bytes(words: &[u16]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, std::mem::size_of_val(words)) }
-}
-
-fn words_as_bytes_mut(words: &mut [u16]) -> &mut [u8] {
-    unsafe {
-        std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, std::mem::size_of_val(words))
-    }
-}
-
-fn io_error(err: std::io::Error, context: &'static str) -> Error {
-    if err.kind() == std::io::ErrorKind::TimedOut {
-        Error::Timeout(context)
-    } else {
-        Error::Usb {
-            source: Box::new(err),
-            context,
-        }
-    }
-}
-
 fn aligned_request_len(max_packet_size: usize, payload_bytes: usize) -> usize {
-    let payload_bytes = payload_bytes.max(max_packet_size.max(1));
+    let payload_bytes = payload_bytes
+        .next_multiple_of(VERICOMM_TRANSFER_PACKET_BYTES)
+        .max(max_packet_size.max(1));
     let rem = payload_bytes % max_packet_size.max(1);
     if rem == 0 {
         payload_bytes
@@ -664,6 +817,10 @@ fn bytes_into_words(bytes: &[u8], out: &mut [u16]) {
     }
 }
 
+fn bytes_as_words(bytes: &[u8]) -> &[u16] {
+    unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u16, bytes.len() / 2) }
+}
+
 fn transfer_error(err: nusb::transfer::TransferError, context: &'static str) -> Error {
     Error::Usb {
         source: Box::new(std::io::Error::other(format!("{context}: {err}"))),
@@ -681,6 +838,18 @@ fn words_to_bytes(words: &[u16], out: &mut [u8]) {
 
 fn bytes_as_words_mut(bytes: &mut [u8]) -> &mut [u16] {
     unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut u16, bytes.len() / 2) }
+}
+
+fn cancel_pending_transfer<Dir>(endpoint: &mut UsbEndpoint<Bulk, Dir>) -> Completion
+where
+    Dir: EndpointDirection,
+{
+    endpoint.cancel_all();
+    loop {
+        if let Some(completion) = endpoint.wait_next_complete(Duration::from_secs(1)) {
+            return completion;
+        }
+    }
 }
 
 #[cfg(test)]

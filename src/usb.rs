@@ -1,7 +1,6 @@
 use crate::error::{Error, Result};
 use nusb::{
     self, Device, DeviceId, DeviceInfo, Interface, MaybeFuture,
-    io::{EndpointRead, EndpointWrite},
     transfer::{Bulk, In, Out},
 };
 use std::{
@@ -238,24 +237,6 @@ impl UsbDevice {
         interface
             .endpoint::<Bulk, Out>(endpoint as u8)
             .map_err(|err| usb_error(err, "nusb_open_out_endpoint"))
-    }
-
-    pub fn open_in_reader(&self, endpoint: Endpoint) -> Result<EndpointRead<Bulk>> {
-        let interface = self.interface.as_ref().ok_or(Error::DeviceNotOpen)?;
-        Ok(interface
-            .endpoint::<Bulk, In>(endpoint as u8)
-            .map_err(|err| usb_error(err, "nusb_open_in_endpoint"))?
-            .reader(IO_BUFFER_SIZE)
-            .with_read_timeout(self.transport.usb_timeout))
-    }
-
-    pub fn open_out_writer(&self, endpoint: Endpoint) -> Result<EndpointWrite<Bulk>> {
-        let interface = self.interface.as_ref().ok_or(Error::DeviceNotOpen)?;
-        Ok(interface
-            .endpoint::<Bulk, Out>(endpoint as u8)
-            .map_err(|err| usb_error(err, "nusb_open_out_endpoint"))?
-            .writer(IO_BUFFER_SIZE)
-            .with_write_timeout(self.transport.usb_timeout))
     }
 
     pub fn register_hotplug_callback<F>(
