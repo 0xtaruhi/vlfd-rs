@@ -1,90 +1,49 @@
 //! # vlfd-rs
 //!
-//! Rust bindings for the SMIMS VLFD board. The crate exposes two high-level
-//! entry points: [`Device`] for day-to-day interaction with VeriComm I/O and
-//! [`Programmer`] for uploading FPGA bitstreams. The following example opens
-//! the device, switches to VeriComm mode, and performs a single FIFO
-//! transaction:
+//! `vlfd-rs` 2.x models the device around explicit sessions instead of a
+//! single stateful façade. Open a [`Board`] to inspect and configure the
+//! hardware, then create dedicated sessions for I/O or programming.
 //!
 //! ```no_run
-//! use vlfd_rs::{Device, IoSettings, Result, TransportConfig};
+//! use vlfd_rs::{Board, IoConfig, Result};
 //!
 //! fn main() -> Result<()> {
-//!     // Establish a connection and load the remote configuration/encryption tables.
-//!     let transport = TransportConfig::default();
-//!     let mut device = Device::connect_with_transport_config(transport)?;
+//!     let mut board = Board::open()?;
+//!     let mut io = board.configure_io(&IoConfig::default())?;
 //!
-//!     // Override default VeriComm timing before entering I/O mode.
-//!     let mut settings = IoSettings::default();
-//!     settings.clock_high_delay = 8;
-//!     settings.clock_low_delay = 8;
-//!     device.enter_io_mode(&settings)?;
-//!
-//!     // Perform a 4-word FIFO round-trip with transparent encryption.
-//!     let tx = [0x1234u16, 0x5678, 0x9abc, 0xdef0];
+//!     let tx = [0x1234u16; 4];
 //!     let mut rx = [0u16; 4];
-//!     device.transfer_io_words(&tx, &mut rx)?;
-//!
-//!     device.exit_io_mode()?;
+//!     io.transfer(&tx, &mut rx)?;
+//!     io.finish()?;
 //!     Ok(())
 //! }
 //! ```
-//!
-//! To reprogram the FPGA, construct a [`Programmer`]:
 //!
 //! ```no_run
 //! use std::path::Path;
 //! use vlfd_rs::{Programmer, Result};
 //!
 //! fn main() -> Result<()> {
-//!     let mut programmer = Programmer::connect()?;
+//!     let mut programmer = Programmer::open()?;
 //!     programmer.program(Path::new("path/to/bitstream.txt"))?;
 //!     programmer.close()?;
 //!     Ok(())
 //! }
 //! ```
-//!
-//! Both examples are tagged with `no_run`, so they compile during `cargo test`
-//! but do not touch live hardware.
+
 pub mod constants;
 
 mod config;
-mod device;
 mod error;
 mod program;
+mod session;
 mod usb;
 
 pub use config::Config;
-pub use device::{Device, DeviceMode, IoSettings};
 pub use error::{Error, Result};
-pub use program::Programmer;
+pub use program::{Programmer, load_bitfile, load_bitfile_from_reader};
+pub use session::{Board, BoardMode, IoConfig, IoSession, ProgramSession};
 pub use usb::{
-    HotplugEvent, HotplugEventKind, HotplugOptions, HotplugRegistration, TransportConfig,
+    HotplugDeviceInfo, HotplugEvent, HotplugEventKind, HotplugOptions, HotplugRegistration, Probe,
+    TransportConfig,
 };
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn device_is_created_closed() {
-        let device = Device::new().expect("failed to initialise USB context");
-        assert!(!device.is_open());
-        assert!(!device.is_initialized());
-        assert_eq!(device.mode(), DeviceMode::Closed);
-    }
-
-    #[test]
-    fn config_mutation_roundtrip() {
-        let mut device = Device::new().expect("failed to initialise USB context");
-        device.update_cached_config(|config| config.set_vericomm_clock_high_delay(42));
-        assert_eq!(device.config().vericomm_clock_high_delay(), 42);
-    }
-
-    #[test]
-    fn programmer_wraps_device() {
-        let device = Device::new().expect("failed to initialise USB context");
-        let programmer = Programmer::new(device);
-        assert!(!programmer.device().is_open());
-    }
-}

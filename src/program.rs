@@ -1,6 +1,5 @@
-use crate::config::Config;
-use crate::device::Device;
 use crate::error::{Error, Result};
+use crate::session::Board;
 use crate::usb::TransportConfig;
 use std::{
     fs::File,
@@ -8,66 +7,47 @@ use std::{
     path::Path,
 };
 
-/// Helper that manages FPGA bitstream uploads using a [`Device`].
 pub struct Programmer {
-    device: Device,
+    board: Board,
 }
 
 impl Programmer {
-    pub fn new(device: Device) -> Self {
-        Self { device }
+    pub fn open() -> Result<Self> {
+        Self::open_with_transport(TransportConfig::default())
     }
 
-    pub fn connect() -> Result<Self> {
-        Self::connect_with_transport_config(TransportConfig::default())
+    pub fn open_with_transport(transport: TransportConfig) -> Result<Self> {
+        Ok(Self {
+            board: Board::open_with_transport(transport)?,
+        })
     }
 
-    pub fn connect_with_transport_config(transport: TransportConfig) -> Result<Self> {
-        let device = Device::connect_with_transport_config(transport)?;
-        Ok(Self { device })
+    pub fn board(&self) -> &Board {
+        &self.board
     }
 
-    pub fn device(&self) -> &Device {
-        &self.device
-    }
-
-    pub fn device_mut(&mut self) -> &mut Device {
-        &mut self.device
-    }
-
-    pub fn close(mut self) -> Result<()> {
-        self.device.close()
+    pub fn board_mut(&mut self) -> &mut Board {
+        &mut self.board
     }
 
     pub fn program(&mut self, bitfile: impl AsRef<Path>) -> Result<()> {
-        let mut program_data = load_bitfile(bitfile.as_ref())?;
+        let words = load_bitfile(bitfile.as_ref())?;
+        let mut session = self.board.programmer()?;
+        session.write_bitstream_words(&words)?;
+        session.finish()
+    }
 
-        self.device.ensure_session()?;
-        self.device.encrypt(&mut program_data);
-        self.device.activate_fpga_programmer_checked()?;
-
-        let chunk_len = bitstream_chunk_words(self.device.config())?;
-        for chunk in program_data.chunks(chunk_len) {
-            self.device.fifo_write(chunk)?;
-        }
-
-        self.device.command_active()?;
-        self.device.read_config()?;
-
-        if !self.device.config().is_programmed() {
-            return Err(Error::NotProgrammed);
-        }
-
-        Ok(())
+    pub fn close(self) -> Result<()> {
+        self.board.close()
     }
 }
 
-fn load_bitfile(path: &Path) -> Result<Vec<u16>> {
+pub fn load_bitfile(path: &Path) -> Result<Vec<u16>> {
     let file = File::open(path)?;
     load_bitfile_from_reader(BufReader::new(file))
 }
 
-fn load_bitfile_from_reader<R: BufRead>(reader: R) -> Result<Vec<u16>> {
+pub fn load_bitfile_from_reader<R: BufRead>(reader: R) -> Result<Vec<u16>> {
     let mut program_data = Vec::new();
 
     for (line_index, line) in reader.lines().enumerate() {
@@ -103,20 +83,10 @@ fn load_bitfile_from_reader<R: BufRead>(reader: R) -> Result<Vec<u16>> {
     Ok(program_data)
 }
 
-fn bitstream_chunk_words(config: &Config) -> Result<usize> {
-    let fifo_words = usize::from(config.fifo_size_words());
-    if fifo_words == 0 {
-        return Err(Error::UnexpectedResponse(
-            "device reported zero-length programming FIFO",
-        ));
-    }
-    Ok(fifo_words)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{bitstream_chunk_words, load_bitfile_from_reader};
-    use crate::{Config, Error};
+    use super::load_bitfile_from_reader;
+    use crate::Error;
     use std::io::Cursor;
 
     #[test]
@@ -137,13 +107,5 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
-    }
-
-    #[test]
-    fn programming_chunk_size_uses_fifo_word_count_directly() {
-        let mut words = [0u16; Config::WORD_COUNT];
-        words[33] = 512;
-        let config = Config::from_words(words);
-        assert_eq!(bitstream_chunk_words(&config).unwrap(), 512);
     }
 }

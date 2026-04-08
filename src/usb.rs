@@ -1,8 +1,11 @@
 use crate::error::{Error, Result};
-use rusb::{
-    self, Context, Device, DeviceHandle, Hotplug, HotplugBuilder, Registration, UsbContext,
+use nusb::{
+    self, Device, DeviceId, DeviceInfo, Interface, MaybeFuture,
+    io::{EndpointRead, EndpointWrite},
+    transfer::{Bulk, In, Out},
 };
 use std::{
+    io::{Read, Write},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -16,6 +19,7 @@ compile_error!("vlfd-rs currently supports little-endian hosts only");
 
 const INTERFACE: u8 = 0;
 const HOTPLUG_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const IO_BUFFER_SIZE: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportConfig {
@@ -63,17 +67,22 @@ pub struct HotplugDeviceInfo {
 }
 
 impl HotplugDeviceInfo {
-    fn from_device(device: &Device<Context>) -> Self {
-        let descriptor = device.device_descriptor().ok();
+    fn from_device_info(device: &DeviceInfo) -> Self {
         Self {
-            bus_number: device.bus_number(),
-            address: device.address(),
-            port_numbers: device.port_numbers().unwrap_or_default(),
-            vendor_id: descriptor.as_ref().map(|desc| desc.vendor_id()),
-            product_id: descriptor.as_ref().map(|desc| desc.product_id()),
-            class_code: descriptor.as_ref().map(|desc| desc.class_code()),
-            sub_class_code: descriptor.as_ref().map(|desc| desc.sub_class_code()),
-            protocol_code: descriptor.as_ref().map(|desc| desc.protocol_code()),
+            #[cfg(target_os = "linux")]
+            bus_number: device.busnum(),
+            #[cfg(not(target_os = "linux"))]
+            bus_number: 0,
+            address: device.device_address(),
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+            port_numbers: device.port_chain().to_vec(),
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+            port_numbers: Vec::new(),
+            vendor_id: Some(device.vendor_id()),
+            product_id: Some(device.product_id()),
+            class_code: Some(device.class()),
+            sub_class_code: Some(device.subclass()),
+            protocol_code: Some(device.protocol()),
         }
     }
 }
@@ -92,38 +101,54 @@ pub struct HotplugOptions {
     pub enumerate: bool,
 }
 
-/// Thin wrapper around a `rusb` device handle that offers higher level helpers
-/// for bulk transfers and automatic cleanup.
-pub struct UsbDevice {
-    context: Context,
-    handle: Option<DeviceHandle<Context>>,
+#[derive(Debug, Clone, Default)]
+pub struct Probe {
     transport: TransportConfig,
 }
 
-impl UsbDevice {
-    pub fn new() -> Result<Self> {
-        Self::with_transport_config(TransportConfig::default())
+impl Probe {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    pub fn with_transport_config(transport: TransportConfig) -> Result<Self> {
-        let context = Context::new().map_err(|err| usb_error(err, "libusb_init"))?;
-        Ok(Self {
-            context,
-            handle: None,
-            transport,
-        })
-    }
-
-    pub fn is_open(&self) -> bool {
-        self.handle.is_some()
+    pub fn with_transport_config(transport: TransportConfig) -> Self {
+        Self { transport }
     }
 
     pub fn transport_config(&self) -> &TransportConfig {
         &self.transport
     }
 
-    pub fn set_transport_config(&mut self, transport: TransportConfig) {
-        self.transport = transport;
+    pub fn watch<F>(&self, options: HotplugOptions, callback: F) -> Result<HotplugRegistration>
+    where
+        F: FnMut(HotplugEvent) + Send + 'static,
+    {
+        UsbDevice::with_transport_config(self.transport)?
+            .register_hotplug_callback(options, callback)
+    }
+}
+
+pub struct UsbDevice {
+    handle: Option<Device>,
+    interface: Option<Interface>,
+    transport: TransportConfig,
+}
+
+impl UsbDevice {
+    pub fn with_transport_config(transport: TransportConfig) -> Result<Self> {
+        Ok(Self {
+            handle: None,
+            interface: None,
+            transport,
+        })
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.interface.is_some()
+    }
+
+    pub fn transport_config(&self) -> &TransportConfig {
+        &self.transport
     }
 
     pub fn open(&mut self, vid: u16, pid: u16) -> Result<()> {
@@ -131,51 +156,59 @@ impl UsbDevice {
             return Ok(());
         }
 
-        let handle = self
-            .context
-            .open_device_with_vid_pid(vid, pid)
+        let device_info = nusb::list_devices()
+            .wait()
+            .map_err(|err| usb_error(err, "nusb_list_devices"))?
+            .find(|device| device.vendor_id() == vid && device.product_id() == pid)
             .ok_or(Error::DeviceNotFound { vid, pid })?;
 
+        let device = device_info
+            .open()
+            .wait()
+            .map_err(|err| usb_error(err, "nusb_open_device"))?;
+
         if self.transport.reset_on_open {
-            handle
+            device
                 .reset()
-                .map_err(|err| usb_error(err, "libusb_reset_device"))?;
+                .wait()
+                .map_err(|err| usb_error(err, "nusb_reset_device"))?;
         }
 
-        handle
-            .claim_interface(INTERFACE)
-            .map_err(|err| usb_error(err, "libusb_claim_interface"))?;
+        let interface = device
+            .detach_and_claim_interface(INTERFACE)
+            .wait()
+            .map_err(|err| usb_error(err, "nusb_claim_interface"))?;
 
-        if self.transport.clear_halt_on_open {
+        let mut usb_device = Self {
+            handle: Some(device),
+            interface: Some(interface),
+            transport: self.transport,
+        };
+
+        if usb_device.transport.clear_halt_on_open {
             for endpoint in [
                 Endpoint::FifoWrite,
                 Endpoint::Command,
                 Endpoint::FifoRead,
                 Endpoint::Sync,
             ] {
-                handle
-                    .clear_halt(endpoint as u8)
-                    .map_err(|err| usb_error(err, "libusb_clear_halt"))?;
+                usb_device.clear_halt(endpoint)?;
             }
         }
 
-        self.handle = Some(handle);
+        *self = usb_device;
         Ok(())
     }
 
     pub fn close(&mut self) -> Result<()> {
-        if let Some(handle) = self.handle.take() {
-            match handle.release_interface(INTERFACE) {
-                Ok(_) | Err(rusb::Error::NoDevice) => {}
-                Err(err) => return Err(usb_error(err, "libusb_release_interface")),
-            }
-        }
+        self.interface.take();
+        self.handle.take();
         Ok(())
     }
 
     pub fn read_bytes(&self, endpoint: Endpoint, buffer: &mut [u8]) -> Result<()> {
-        let handle = self.handle.as_ref().ok_or(Error::DeviceNotOpen)?;
-        bulk_read(handle, endpoint, buffer, self.transport.usb_timeout)
+        let interface = self.interface.as_ref().ok_or(Error::DeviceNotOpen)?;
+        bulk_read(interface, endpoint, buffer, self.transport.usb_timeout)
     }
 
     pub fn read_words(&self, endpoint: Endpoint, buffer: &mut [u16]) -> Result<()> {
@@ -184,8 +217,8 @@ impl UsbDevice {
     }
 
     pub fn write_bytes(&self, endpoint: Endpoint, buffer: &[u8]) -> Result<()> {
-        let handle = self.handle.as_ref().ok_or(Error::DeviceNotOpen)?;
-        bulk_write(handle, endpoint, buffer, self.transport.usb_timeout)
+        let interface = self.interface.as_ref().ok_or(Error::DeviceNotOpen)?;
+        bulk_write(interface, endpoint, buffer, self.transport.usb_timeout)
     }
 
     pub fn write_words(&self, endpoint: Endpoint, buffer: &[u16]) -> Result<()> {
@@ -193,36 +226,131 @@ impl UsbDevice {
         self.write_bytes(endpoint, raw)
     }
 
+    pub fn open_in_endpoint(&self, endpoint: Endpoint) -> Result<nusb::Endpoint<Bulk, In>> {
+        let interface = self.interface.as_ref().ok_or(Error::DeviceNotOpen)?;
+        interface
+            .endpoint::<Bulk, In>(endpoint as u8)
+            .map_err(|err| usb_error(err, "nusb_open_in_endpoint"))
+    }
+
+    pub fn open_out_endpoint(&self, endpoint: Endpoint) -> Result<nusb::Endpoint<Bulk, Out>> {
+        let interface = self.interface.as_ref().ok_or(Error::DeviceNotOpen)?;
+        interface
+            .endpoint::<Bulk, Out>(endpoint as u8)
+            .map_err(|err| usb_error(err, "nusb_open_out_endpoint"))
+    }
+
+    pub fn open_in_reader(&self, endpoint: Endpoint) -> Result<EndpointRead<Bulk>> {
+        let interface = self.interface.as_ref().ok_or(Error::DeviceNotOpen)?;
+        Ok(interface
+            .endpoint::<Bulk, In>(endpoint as u8)
+            .map_err(|err| usb_error(err, "nusb_open_in_endpoint"))?
+            .reader(IO_BUFFER_SIZE)
+            .with_read_timeout(self.transport.usb_timeout))
+    }
+
+    pub fn open_out_writer(&self, endpoint: Endpoint) -> Result<EndpointWrite<Bulk>> {
+        let interface = self.interface.as_ref().ok_or(Error::DeviceNotOpen)?;
+        Ok(interface
+            .endpoint::<Bulk, Out>(endpoint as u8)
+            .map_err(|err| usb_error(err, "nusb_open_out_endpoint"))?
+            .writer(IO_BUFFER_SIZE)
+            .with_write_timeout(self.transport.usb_timeout))
+    }
+
     pub fn register_hotplug_callback<F>(
         &self,
         options: HotplugOptions,
-        callback: F,
+        mut callback: F,
     ) -> Result<HotplugRegistration>
     where
         F: FnMut(HotplugEvent) + Send + 'static,
     {
-        if !rusb::has_hotplug() {
-            return Err(Error::FeatureUnavailable("usb_hotplug"));
+        let mut seen_devices = Vec::<(DeviceId, HotplugDeviceInfo)>::new();
+        let initial_devices = matching_devices(options)?;
+        if options.enumerate {
+            for device in &initial_devices {
+                callback(HotplugEvent {
+                    kind: HotplugEventKind::Arrived,
+                    device: HotplugDeviceInfo::from_device_info(device),
+                });
+            }
         }
+        seen_devices.extend(
+            initial_devices
+                .iter()
+                .map(|device| (device.id(), HotplugDeviceInfo::from_device_info(device))),
+        );
 
-        let mut builder = HotplugBuilder::new();
-        if let Some(vendor) = options.vendor_id {
-            builder.vendor_id(vendor);
-        }
-        if let Some(product) = options.product_id {
-            builder.product_id(product);
-        }
-        if let Some(class_code) = options.class_code {
-            builder.class(class_code);
-        }
-        builder.enumerate(options.enumerate);
+        let running = Arc::new(AtomicBool::new(true));
+        let thread_running = Arc::clone(&running);
+        let thread = thread::Builder::new()
+            .name("vlfd-usb-hotplug".into())
+            .spawn(move || {
+                let mut known = seen_devices;
+                while thread_running.load(Ordering::Relaxed) {
+                    if let Ok(devices) = matching_devices(options) {
+                        let mut current = devices
+                            .iter()
+                            .map(|device| {
+                                (device.id(), HotplugDeviceInfo::from_device_info(device))
+                            })
+                            .collect::<Vec<_>>();
 
-        let handler = CallbackHotplug { callback };
-        let registration = builder
-            .register(&self.context, Box::new(handler))
-            .map_err(|err| usb_error(err, "libusb_hotplug_register_callback"))?;
+                        for (id, info) in &current {
+                            if !known.iter().any(|(known_id, _)| known_id == id) {
+                                callback(HotplugEvent {
+                                    kind: HotplugEventKind::Arrived,
+                                    device: info.clone(),
+                                });
+                            }
+                        }
 
-        HotplugRegistration::new(self.context.clone(), registration)
+                        for (id, info) in &known {
+                            if !current.iter().any(|(current_id, _)| current_id == id) {
+                                callback(HotplugEvent {
+                                    kind: HotplugEventKind::Left,
+                                    device: info.clone(),
+                                });
+                            }
+                        }
+
+                        known.clear();
+                        known.append(&mut current);
+                    }
+
+                    thread::sleep(HOTPLUG_POLL_INTERVAL);
+                }
+            })
+            .map_err(Error::Io)?;
+
+        Ok(HotplugRegistration {
+            running,
+            thread: Some(thread),
+        })
+    }
+
+    fn clear_halt(&mut self, endpoint: Endpoint) -> Result<()> {
+        let interface = self.interface.as_ref().ok_or(Error::DeviceNotOpen)?;
+        match endpoint {
+            Endpoint::FifoWrite | Endpoint::Command => {
+                let mut ep = interface
+                    .endpoint::<Bulk, Out>(endpoint as u8)
+                    .map_err(|err| usb_error(err, "nusb_open_out_endpoint"))?;
+                ep.clear_halt()
+                    .wait()
+                    .map_err(|err| usb_error(err, "nusb_clear_halt"))?;
+            }
+            Endpoint::FifoRead | Endpoint::Sync => {
+                let mut ep = interface
+                    .endpoint::<Bulk, In>(endpoint as u8)
+                    .map_err(|err| usb_error(err, "nusb_open_in_endpoint"))?;
+                ep.clear_halt()
+                    .wait()
+                    .map_err(|err| usb_error(err, "nusb_clear_halt"))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -234,40 +362,12 @@ impl Drop for UsbDevice {
 
 #[derive(Debug)]
 pub struct HotplugRegistration {
-    registration: Option<Registration<Context>>,
     running: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
-impl HotplugRegistration {
-    fn new(context: Context, registration: Registration<Context>) -> Result<Self> {
-        let running = Arc::new(AtomicBool::new(true));
-        let thread_running = Arc::clone(&running);
-
-        let thread = thread::Builder::new()
-            .name("vlfd-usb-hotplug".into())
-            .spawn(move || {
-                while thread_running.load(Ordering::Relaxed) {
-                    match context.handle_events(Some(HOTPLUG_POLL_INTERVAL)) {
-                        Ok(_) => {}
-                        Err(rusb::Error::Interrupted) | Err(rusb::Error::Timeout) => continue,
-                        Err(_) => break,
-                    }
-                }
-            })
-            .map_err(Error::Io)?;
-
-        Ok(Self {
-            registration: Some(registration),
-            running,
-            thread: Some(thread),
-        })
-    }
-}
-
 impl Drop for HotplugRegistration {
     fn drop(&mut self) {
-        let _ = self.registration.take();
         self.running.store(false, Ordering::SeqCst);
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
@@ -275,96 +375,89 @@ impl Drop for HotplugRegistration {
     }
 }
 
-struct CallbackHotplug<F>
-where
-    F: FnMut(HotplugEvent) + Send + 'static,
-{
-    callback: F,
-}
-
-impl<F> Hotplug<Context> for CallbackHotplug<F>
-where
-    F: FnMut(HotplugEvent) + Send + 'static,
-{
-    fn device_arrived(&mut self, device: Device<Context>) {
-        (self.callback)(HotplugEvent {
-            kind: HotplugEventKind::Arrived,
-            device: HotplugDeviceInfo::from_device(&device),
-        });
-    }
-
-    fn device_left(&mut self, device: Device<Context>) {
-        (self.callback)(HotplugEvent {
-            kind: HotplugEventKind::Left,
-            device: HotplugDeviceInfo::from_device(&device),
-        });
-    }
-}
-
-fn bulk_read<T: UsbContext>(
-    handle: &DeviceHandle<T>,
+fn bulk_read(
+    interface: &Interface,
     endpoint: Endpoint,
     buffer: &mut [u8],
     timeout: Duration,
 ) -> Result<()> {
-    let mut offset = 0;
-    while offset < buffer.len() {
-        let chunk = &mut buffer[offset..];
-        let bytes_read = handle
-            .read_bulk(endpoint as u8, chunk, timeout)
-            .map_err(|err| usb_error(err, "libusb_bulk_read"))?;
+    let mut reader = interface
+        .endpoint::<Bulk, In>(endpoint as u8)
+        .map_err(|err| usb_error(err, "nusb_open_in_endpoint"))?
+        .reader(IO_BUFFER_SIZE)
+        .with_read_timeout(timeout);
 
-        if bytes_read == 0 {
-            return Err(Error::UnexpectedResponse("bulk read returned zero bytes"));
-        }
-
-        offset += bytes_read;
-    }
+    reader
+        .read_exact(buffer)
+        .map_err(|err| io_error(err, "nusb_bulk_read"))?;
     Ok(())
 }
 
-fn bulk_write<T: UsbContext>(
-    handle: &DeviceHandle<T>,
+fn bulk_write(
+    interface: &Interface,
     endpoint: Endpoint,
     buffer: &[u8],
     timeout: Duration,
 ) -> Result<()> {
-    let mut offset = 0;
-    while offset < buffer.len() {
-        let chunk = &buffer[offset..];
-        let bytes_written = handle
-            .write_bulk(endpoint as u8, chunk, timeout)
-            .map_err(|err| usb_error(err, "libusb_bulk_write"))?;
+    let mut writer = interface
+        .endpoint::<Bulk, Out>(endpoint as u8)
+        .map_err(|err| usb_error(err, "nusb_open_out_endpoint"))?
+        .writer(IO_BUFFER_SIZE)
+        .with_write_timeout(timeout);
 
-        if bytes_written == 0 {
-            return Err(Error::UnexpectedResponse("bulk write returned zero bytes"));
-        }
-
-        offset += bytes_written;
-    }
+    writer
+        .write_all(buffer)
+        .map_err(|err| io_error(err, "nusb_bulk_write"))?;
+    writer
+        .flush()
+        .map_err(|err| io_error(err, "nusb_bulk_flush"))?;
     Ok(())
 }
 
+fn matching_devices(options: HotplugOptions) -> Result<Vec<DeviceInfo>> {
+    let devices = nusb::list_devices()
+        .wait()
+        .map_err(|err| usb_error(err, "nusb_list_devices"))?;
+    Ok(devices
+        .filter(|device| {
+            options
+                .vendor_id
+                .is_none_or(|vendor_id| device.vendor_id() == vendor_id)
+                && options
+                    .product_id
+                    .is_none_or(|product_id| device.product_id() == product_id)
+                && options
+                    .class_code
+                    .is_none_or(|class_code| device.class() == class_code)
+        })
+        .collect())
+}
+
 fn words_as_bytes(words: &[u16]) -> &[u8] {
-    // SAFETY: `u16` is a plain-old-data type, the slice is valid for reads, and
-    // the crate is restricted to little-endian hosts to match the device's
-    // wire format.
     unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, std::mem::size_of_val(words)) }
 }
 
 fn words_as_bytes_mut(words: &mut [u16]) -> &mut [u8] {
-    // SAFETY: `u16` is a plain-old-data type, the slice is valid for writes,
-    // and the crate is restricted to little-endian hosts to match the device's
-    // wire format.
     unsafe {
         std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, std::mem::size_of_val(words))
     }
 }
 
-fn usb_error(err: rusb::Error, context: &'static str) -> Error {
+fn usb_error(err: nusb::Error, context: &'static str) -> Error {
     Error::Usb {
-        source: err,
+        source: Box::new(err),
         context,
+    }
+}
+
+fn io_error(err: std::io::Error, context: &'static str) -> Error {
+    if err.kind() == std::io::ErrorKind::TimedOut {
+        Error::Timeout(context)
+    } else {
+        Error::Usb {
+            source: Box::new(err),
+            context,
+        }
     }
 }
 

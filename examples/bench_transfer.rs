@@ -4,7 +4,7 @@ use std::{
     process,
     time::{Duration, Instant},
 };
-use vlfd_rs::{Device, IoSettings, TransportConfig};
+use vlfd_rs::{Board, IoConfig, TransportConfig};
 
 fn main() {
     if let Err(err) = real_main() {
@@ -74,16 +74,14 @@ impl Options {
         while let Some(flag) = args.next() {
             match flag.as_str() {
                 "--iterations" => {
-                    options.iterations = next_value(&mut args, "--iterations")?.parse()?;
+                    options.iterations = next_value(&mut args, "--iterations")?.parse()?
                 }
-                "--words" => {
-                    options.words = next_value(&mut args, "--words")?.parse()?;
-                }
+                "--words" => options.words = next_value(&mut args, "--words")?.parse()?,
                 "--clock-high" => {
-                    options.clock_high_delay = next_value(&mut args, "--clock-high")?.parse()?;
+                    options.clock_high_delay = next_value(&mut args, "--clock-high")?.parse()?
                 }
                 "--clock-low" => {
-                    options.clock_low_delay = next_value(&mut args, "--clock-low")?.parse()?;
+                    options.clock_low_delay = next_value(&mut args, "--clock-low")?.parse()?
                 }
                 "--usb-timeout-ms" => {
                     let value: u64 = next_value(&mut args, "--usb-timeout-ms")?.parse()?;
@@ -93,12 +91,8 @@ impl Options {
                     let value: u64 = next_value(&mut args, "--sync-timeout-ms")?.parse()?;
                     options.transport.sync_timeout = Duration::from_millis(value);
                 }
-                "--reset-on-open" => {
-                    options.transport.reset_on_open = true;
-                }
-                "--no-clear-halt" => {
-                    options.transport.clear_halt_on_open = false;
-                }
+                "--reset-on-open" => options.transport.reset_on_open = true,
+                "--no-clear-halt" => options.transport.clear_halt_on_open = false,
                 "--help" | "-h" => {
                     print_usage();
                     process::exit(0);
@@ -143,34 +137,24 @@ fn run_cpu_bench(options: &Options) -> Result<(), Box<dyn Error>> {
 }
 
 fn run_device_bench(options: &Options) -> Result<(), Box<dyn Error>> {
-    let mut device = Device::connect_with_transport_config(options.transport)?;
-    let io = IoSettings {
+    let mut board = Board::open_with_transport(options.transport)?;
+    let mut io = board.configure_io(&IoConfig {
         clock_high_delay: options.clock_high_delay,
         clock_low_delay: options.clock_low_delay,
-        ..IoSettings::default()
-    };
-    device.enter_io_mode(&io)?;
+        ..IoConfig::default()
+    })?;
 
     let template = vec![0x1234u16; options.words];
     let mut rx = vec![0u16; options.words];
 
     let started = Instant::now();
     for _ in 0..options.iterations {
-        device.transfer_io_words(&template, &mut rx)?;
+        io.transfer(&template, &mut rx)?;
     }
     let elapsed = started.elapsed();
-    device.exit_io_mode()?;
+    io.finish()?;
 
     print_summary("device", options.words, options.iterations, elapsed);
-    println!(
-        "clock_high_delay={} clock_low_delay={} usb_timeout_ms={} sync_timeout_ms={} reset_on_open={} clear_halt_on_open={}",
-        options.clock_high_delay,
-        options.clock_low_delay,
-        options.transport.usb_timeout.as_millis(),
-        options.transport.sync_timeout.as_millis(),
-        options.transport.reset_on_open,
-        options.transport.clear_halt_on_open,
-    );
     Ok(())
 }
 

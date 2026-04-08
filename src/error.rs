@@ -1,6 +1,4 @@
-use rusb::Error as UsbLibError;
-use std::fmt;
-
+use std::{error::Error as StdError, fmt};
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
@@ -38,7 +36,7 @@ pub enum Error {
         actual: u16,
     },
     Usb {
-        source: UsbLibError,
+        source: Box<dyn StdError + Send + Sync>,
         context: &'static str,
     },
     Io(std::io::Error),
@@ -98,7 +96,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Usb { source, .. } => Some(source),
+            Error::Usb { source, .. } => Some(source.as_ref()),
             Error::Io(err) => Some(err),
             _ => None,
         }
