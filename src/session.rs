@@ -430,20 +430,20 @@ impl IoSession<'_> {
 
         self.ensure_pipeline_endpoints()?;
 
+        let max_packet_size = self
+            .pipeline_read
+            .as_ref()
+            .expect("pipeline read endpoint should be initialized")
+            .max_packet_size();
+        let request_bytes = batch_request_lengths(max_packet_size, txs);
         let max_bytes = txs
             .iter()
             .map(|tx| std::mem::size_of_val(*tx))
             .max()
             .unwrap_or(0);
-        let request_bytes = aligned_request_len(
-            self.pipeline_read
-                .as_ref()
-                .expect("pipeline read endpoint should be initialized")
-                .max_packet_size(),
-            max_bytes,
-        );
+        let max_request_bytes = request_bytes.iter().copied().max().unwrap_or(0);
         let pipeline_depth = txs.len().min(MAX_PIPELINE_DEPTH);
-        self.prepare_pools(pipeline_depth, max_bytes, request_bytes);
+        self.prepare_pools(pipeline_depth, max_bytes, max_request_bytes);
         let mut outputs = rx_lengths
             .iter()
             .map(|len| vec![0u16; *len])
@@ -468,7 +468,7 @@ impl IoSession<'_> {
                     .as_mut()
                     .expect("pipeline read endpoint should be initialized"),
                 rx_buffer,
-                request_bytes,
+                request_bytes[submitted],
             );
             submitted += 1;
         }
@@ -530,7 +530,7 @@ impl IoSession<'_> {
                         .as_mut()
                         .expect("pipeline read endpoint should be initialized"),
                     rx_buffer,
-                    request_bytes,
+                    request_bytes[submitted],
                 );
                 submitted += 1;
             }
@@ -787,6 +787,16 @@ fn aligned_request_len(max_packet_size: usize, payload_bytes: usize) -> usize {
     }
 }
 
+fn request_bytes_for_words(max_packet_size: usize, word_len: usize) -> usize {
+    aligned_request_len(max_packet_size, word_len * std::mem::size_of::<u16>())
+}
+
+fn batch_request_lengths(max_packet_size: usize, txs: &[&[u16]]) -> Vec<usize> {
+    txs.iter()
+        .map(|tx| request_bytes_for_words(max_packet_size, tx.len()))
+        .collect()
+}
+
 fn submit_pipeline_write(
     crypto: &mut CryptoState,
     endpoint: &mut UsbEndpoint<Bulk, Out>,
@@ -866,6 +876,15 @@ mod tests {
     fn aligned_request_len_rounds_up_to_packet_boundary() {
         assert_eq!(super::aligned_request_len(512, 513), 1024);
         assert_eq!(super::aligned_request_len(512, 512), 512);
+    }
+
+    #[test]
+    fn batch_request_lengths_keep_each_frame_request_size() {
+        let short = vec![0x1234u16; 256];
+        let long = vec![0x5678u16; 512];
+        let txs = vec![short.as_slice(), long.as_slice()];
+
+        assert_eq!(super::batch_request_lengths(512, &txs), vec![512, 1024]);
     }
 
     #[test]
