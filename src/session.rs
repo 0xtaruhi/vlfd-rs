@@ -277,7 +277,7 @@ impl IoSession<'_> {
         Ok(())
     }
 
-    pub fn transfer_batch_slices(
+    fn transfer_batch_slices(
         &mut self,
         txs: &[&[u16]],
         rx_lengths: &[usize],
@@ -389,6 +389,31 @@ impl IoSession<'_> {
         let inputs = txs.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let rx_lengths = txs.iter().map(Vec::len).collect::<Vec<_>>();
         self.transfer_batch_slices(&inputs, &rx_lengths)
+    }
+
+    pub fn transfer_into(&mut self, tx: &[u16], rx: &mut [u16]) -> Result<()> {
+        self.transfer(tx, rx)
+    }
+
+    pub fn transfer_batch_into(
+        &mut self,
+        txs: &[&[u16]],
+        outputs: &mut [&mut [u16]],
+    ) -> Result<()> {
+        if txs.len() != outputs.len() {
+            return Err(Error::InvalidBufferLength {
+                context: "vericomm batch in-place transfer",
+                expected: txs.len(),
+                actual: outputs.len(),
+            });
+        }
+
+        let rx_lengths = outputs.iter().map(|out| out.len()).collect::<Vec<_>>();
+        let results = self.transfer_batch_slices(txs, &rx_lengths)?;
+        for (result, out) in results.into_iter().zip(outputs.iter_mut()) {
+            out.copy_from_slice(&result);
+        }
+        Ok(())
     }
 
     pub fn finish(mut self) -> Result<()> {
@@ -672,6 +697,19 @@ mod tests {
     fn aligned_request_len_rounds_up_to_packet_boundary() {
         assert_eq!(super::aligned_request_len(512, 513), 1024);
         assert_eq!(super::aligned_request_len(512, 512), 512);
+    }
+
+    #[test]
+    fn batch_in_place_error_shape_is_stable() {
+        let err = Error::InvalidBufferLength {
+            context: "vericomm batch in-place transfer",
+            expected: 1,
+            actual: 0,
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid buffer length for `vericomm batch in-place transfer` (expected 1, got 0)"
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ This release redesigns the public API around explicit sessions:
 ## Features
 - Pure-Rust USB transport powered by `nusb`
 - Explicit board / I/O / programming session boundaries
+- Reusable-buffer output APIs for lower-allocation I/O paths
 - High-level configuration refresh and write helpers
 - Bitstream upload support for the integrated FPGA programmer
 - Hotplug callbacks powered by a `nusb`-based polling watcher

@@ -13,7 +13,7 @@
 //!
 //!     let tx = [0x1234u16; 4];
 //!     let mut rx = [0u16; 4];
-//!     io.transfer(&tx, &mut rx)?;
+//!     io.transfer_into(&tx, &mut rx)?;
 //!     io.finish()?;
 //!     Ok(())
 //! }
