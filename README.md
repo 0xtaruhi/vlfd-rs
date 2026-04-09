@@ -50,7 +50,7 @@ fn main() -> Result<()> {
 Add the crate to your `Cargo.toml`:
 ```toml
 [dependencies]
-vlfd-rs = "2.0.0"
+vlfd-rs = "2"
 ```
 
 ## API Notes

@@ -282,6 +282,9 @@ impl IoSession<'_> {
     }
 
     fn prepare_pools(&mut self, pipeline_depth: usize, tx_bytes: usize, rx_bytes: usize) {
+        let tx_bytes = tx_bytes.max(1);
+        let rx_bytes = rx_bytes.max(1);
+
         let pipeline_write = self
             .pipeline_write
             .as_mut()
@@ -290,12 +293,16 @@ impl IoSession<'_> {
             .pipeline_read
             .as_mut()
             .expect("pipeline read endpoint should be initialized");
+
+        discard_undersized_buffers(&mut self.tx_pool, tx_bytes);
+        discard_undersized_buffers(&mut self.rx_pool, rx_bytes);
+
         while self.tx_pool.len() < pipeline_depth {
-            self.tx_pool.push(pipeline_write.allocate(tx_bytes.max(1)));
+            self.tx_pool.push(pipeline_write.allocate(tx_bytes));
         }
         while self.rx_pool.len() < pipeline_depth {
-            let mut buffer = pipeline_read.allocate(rx_bytes.max(1));
-            buffer.set_requested_len(rx_bytes.max(1));
+            let mut buffer = pipeline_read.allocate(rx_bytes);
+            buffer.set_requested_len(rx_bytes);
             self.rx_pool.push(buffer);
         }
     }
@@ -797,6 +804,10 @@ fn batch_request_lengths(max_packet_size: usize, txs: &[&[u16]]) -> Vec<usize> {
         .collect()
 }
 
+fn discard_undersized_buffers(pool: &mut Vec<Buffer>, min_capacity: usize) {
+    pool.retain(|buffer| buffer.capacity() >= min_capacity);
+}
+
 fn submit_pipeline_write(
     crypto: &mut CryptoState,
     endpoint: &mut UsbEndpoint<Bulk, Out>,
@@ -864,6 +875,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use nusb::transfer::Buffer;
+
     #[test]
     fn words_to_bytes_roundtrip() {
         let words = [0x1234u16, 0xabcd];
@@ -885,6 +898,20 @@ mod tests {
         let txs = vec![short.as_slice(), long.as_slice()];
 
         assert_eq!(super::batch_request_lengths(512, &txs), vec![512, 1024]);
+    }
+
+    #[test]
+    fn discard_undersized_buffers_drops_stale_pool_entries() {
+        let mut pool = vec![
+            Buffer::from(vec![0u8; 512]),
+            Buffer::from(vec![0u8; 1024]),
+            Buffer::from(vec![0u8; 256]),
+        ];
+
+        super::discard_undersized_buffers(&mut pool, 600);
+
+        let capacities = pool.iter().map(Buffer::capacity).collect::<Vec<_>>();
+        assert_eq!(capacities, vec![1024]);
     }
 
     #[test]
