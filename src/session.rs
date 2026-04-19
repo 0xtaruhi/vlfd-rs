@@ -692,10 +692,9 @@ impl<'a> IoSession<'a> {
                 .expect("pipeline write endpoint should be initialized")
                 .wait_next_complete(self.board.transport().usb_timeout)
                 .ok_or(Error::Timeout("pipeline_write"))?;
-            write_completion
-                .status
-                .map_err(|err| transfer_error(err, "pipeline_write"))?;
+            let write_status = write_completion.status;
             self.tx_pool.push(write_completion.buffer);
+            write_status.map_err(|err| transfer_error(err, "pipeline_write"))?;
             profiler.add(TransferProfileStage::WaitWrite, stage_started.elapsed());
 
             let stage_started = Instant::now();
@@ -705,17 +704,20 @@ impl<'a> IoSession<'a> {
                 .expect("pipeline read endpoint should be initialized")
                 .wait_next_complete(self.board.transport().usb_timeout)
                 .ok_or(Error::Timeout("pipeline_read"))?;
-            read_completion
-                .status
-                .map_err(|err| transfer_error(err, "pipeline_read"))?;
             let actual_len = read_completion.actual_len;
+            let read_status = read_completion.status;
             let read_buffer = read_completion.buffer;
+            if let Err(err) = read_status {
+                self.rx_pool.push(read_buffer);
+                return Err(transfer_error(err, "pipeline_read"));
+            }
             profiler.add(TransferProfileStage::WaitRead, stage_started.elapsed());
 
             let stage_started = Instant::now();
             let output = &mut *outputs[completed];
             let expected_bytes = std::mem::size_of_val(output);
             if actual_len < expected_bytes {
+                self.rx_pool.push(read_buffer);
                 return Err(Error::UnexpectedResponse(
                     "pipeline read returned short payload",
                 ));
@@ -890,10 +892,9 @@ impl<'session, 'board> IoTransferWindow<'session, 'board> {
             .expect("pipeline write endpoint should be initialized")
             .wait_next_complete(self.io.board.transport().usb_timeout)
             .ok_or(Error::Timeout("pipeline_write"))?;
-        write_completion
-            .status
-            .map_err(|err| transfer_error(err, "pipeline_write"))?;
+        let write_status = write_completion.status;
         self.io.tx_pool.push(write_completion.buffer);
+        write_status.map_err(|err| transfer_error(err, "pipeline_write"))?;
         profiler.add(TransferProfileStage::WaitWrite, stage_started.elapsed());
 
         let stage_started = Instant::now();
@@ -904,16 +905,21 @@ impl<'session, 'board> IoTransferWindow<'session, 'board> {
             .expect("pipeline read endpoint should be initialized")
             .wait_next_complete(self.io.board.transport().usb_timeout)
             .ok_or(Error::Timeout("pipeline_read"))?;
-        read_completion
-            .status
-            .map_err(|err| transfer_error(err, "pipeline_read"))?;
         let actual_len = read_completion.actual_len;
+        let read_status = read_completion.status;
         let read_buffer = read_completion.buffer;
+        if let Err(err) = read_status {
+            self.io.rx_pool.push(read_buffer);
+            self.pending_words.pop_front();
+            return Err(transfer_error(err, "pipeline_read"));
+        }
         profiler.add(TransferProfileStage::WaitRead, stage_started.elapsed());
 
         let stage_started = Instant::now();
         let expected_bytes = std::mem::size_of_val(output);
         if actual_len < expected_bytes {
+            self.io.rx_pool.push(read_buffer);
+            self.pending_words.pop_front();
             return Err(Error::UnexpectedResponse(
                 "pipeline read returned short payload",
             ));
