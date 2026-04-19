@@ -42,7 +42,9 @@ mod usb;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use program::{Programmer, load_bitfile, load_bitfile_from_reader};
-pub use session::{Board, BoardMode, IoConfig, IoSession, ProgramSession};
+pub use session::{
+    Board, BoardMode, IoConfig, IoSession, IoTransferWindow, ProgramSession, TransferStageProfile,
+};
 pub use usb::{
     HotplugDeviceInfo, HotplugEvent, HotplugEventKind, HotplugOptions, HotplugRegistration, Probe,
     TransportConfig,
