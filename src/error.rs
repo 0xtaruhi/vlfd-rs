@@ -28,6 +28,10 @@ pub enum Error {
         expected: &'static str,
         actual: &'static str,
     },
+    PipelineEmpty,
+    PipelineFull {
+        capacity: usize,
+    },
     NotProgrammed,
     Timeout(&'static str),
     UnexpectedResponse(&'static str),
@@ -76,6 +80,11 @@ impl fmt::Display for Error {
                     "invalid device mode (expected `{expected}`, got `{actual}`)"
                 )
             }
+            Error::PipelineEmpty => write!(f, "transfer pipeline has no pending transfers"),
+            Error::PipelineFull { capacity } => write!(
+                f,
+                "transfer pipeline is full (capacity {capacity} outstanding transfers)"
+            ),
             Error::NotProgrammed => write!(f, "FPGA is not programmed"),
             Error::Timeout(context) => write!(f, "operation `{context}` timed out"),
             Error::UnexpectedResponse(context) => {

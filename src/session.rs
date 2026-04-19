@@ -6,11 +6,109 @@ use nusb::{
     Endpoint as UsbEndpoint,
     transfer::{Buffer, Bulk, Completion, EndpointDirection, In, Out},
 };
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 const CONTROL_COMMAND_PREFIX: u8 = 0x01;
 const VERICOMM_TRANSFER_PACKET_BYTES: usize = 8;
 const MAX_PIPELINE_DEPTH: usize = 512;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransferStageProfile {
+    pub calls: u64,
+    pub transfers: u64,
+    pub validation: Duration,
+    pub setup: Duration,
+    pub submit: Duration,
+    pub wait_write: Duration,
+    pub wait_read: Duration,
+    pub decode_copy: Duration,
+    pub refill_submit: Duration,
+}
+
+impl TransferStageProfile {
+    pub fn merge(&mut self, other: &Self) {
+        self.calls = self.calls.saturating_add(other.calls);
+        self.transfers = self.transfers.saturating_add(other.transfers);
+        self.validation = self.validation.saturating_add(other.validation);
+        self.setup = self.setup.saturating_add(other.setup);
+        self.submit = self.submit.saturating_add(other.submit);
+        self.wait_write = self.wait_write.saturating_add(other.wait_write);
+        self.wait_read = self.wait_read.saturating_add(other.wait_read);
+        self.decode_copy = self.decode_copy.saturating_add(other.decode_copy);
+        self.refill_submit = self.refill_submit.saturating_add(other.refill_submit);
+    }
+
+    pub fn total_duration(&self) -> Duration {
+        self.validation
+            .saturating_add(self.setup)
+            .saturating_add(self.submit)
+            .saturating_add(self.wait_write)
+            .saturating_add(self.wait_read)
+            .saturating_add(self.decode_copy)
+            .saturating_add(self.refill_submit)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TransferProfileStage {
+    Validation,
+    Setup,
+    Submit,
+    WaitWrite,
+    WaitRead,
+    DecodeCopy,
+    RefillSubmit,
+}
+
+struct TransferProfiler<'a> {
+    profile: Option<&'a mut TransferStageProfile>,
+}
+
+impl<'a> TransferProfiler<'a> {
+    fn new(profile: Option<&'a mut TransferStageProfile>, transfers: usize) -> Self {
+        let mut profiler = Self { profile };
+        if let Some(profile) = profiler.profile.as_deref_mut() {
+            profile.calls = profile.calls.saturating_add(1);
+            profile.transfers = profile.transfers.saturating_add(transfers as u64);
+        }
+        profiler
+    }
+
+    fn borrow(profile: Option<&'a mut TransferStageProfile>) -> Self {
+        Self { profile }
+    }
+
+    fn add(&mut self, stage: TransferProfileStage, elapsed: Duration) {
+        let Some(profile) = self.profile.as_deref_mut() else {
+            return;
+        };
+
+        match stage {
+            TransferProfileStage::Validation => {
+                profile.validation = profile.validation.saturating_add(elapsed);
+            }
+            TransferProfileStage::Setup => {
+                profile.setup = profile.setup.saturating_add(elapsed);
+            }
+            TransferProfileStage::Submit => {
+                profile.submit = profile.submit.saturating_add(elapsed);
+            }
+            TransferProfileStage::WaitWrite => {
+                profile.wait_write = profile.wait_write.saturating_add(elapsed);
+            }
+            TransferProfileStage::WaitRead => {
+                profile.wait_read = profile.wait_read.saturating_add(elapsed);
+            }
+            TransferProfileStage::DecodeCopy => {
+                profile.decode_copy = profile.decode_copy.saturating_add(elapsed);
+            }
+            TransferProfileStage::RefillSubmit => {
+                profile.refill_submit = profile.refill_submit.saturating_add(elapsed);
+            }
+        }
+    }
+}
 
 pub struct Board {
     usb: UsbDevice,
@@ -228,7 +326,18 @@ pub struct IoSession<'a> {
     finished: bool,
 }
 
-impl IoSession<'_> {
+/// A rolling VeriComm pipeline that keeps up to `capacity` transfers in flight.
+///
+/// Submit frames with [`Self::submit`] and retire them in order with
+/// [`Self::receive_into`]. Dropping the window cancels any remaining
+/// transfers and recycles their buffers back into the parent [`IoSession`].
+pub struct IoTransferWindow<'session, 'board> {
+    io: &'session mut IoSession<'board>,
+    capacity: usize,
+    pending_words: VecDeque<usize>,
+}
+
+impl<'a> IoSession<'a> {
     fn cleanup(&mut self) -> Result<()> {
         if let Some(pipeline_write) = self.pipeline_write.as_mut() {
             pipeline_write.cancel_all();
@@ -306,13 +415,80 @@ impl IoSession<'_> {
             self.rx_pool.push(buffer);
         }
     }
-    pub fn transfer(&mut self, tx: &[u16], rx: &mut [u16]) -> Result<()> {
+
+    /// Opens a rolling transfer window that can keep `capacity` VeriComm
+    /// transfers outstanding at once.
+    pub fn transfer_window(&mut self, capacity: usize) -> Result<IoTransferWindow<'_, 'a>> {
+        if capacity == 0 {
+            return Err(Error::InvalidBufferLength {
+                context: "vericomm transfer window",
+                expected: 1,
+                actual: 0,
+            });
+        }
+
+        Ok(IoTransferWindow {
+            io: self,
+            capacity: capacity.min(MAX_PIPELINE_DEPTH),
+            pending_words: VecDeque::with_capacity(capacity.min(MAX_PIPELINE_DEPTH)),
+        })
+    }
+
+    fn submit_window_transfer(&mut self, tx: &[u16], request_bytes: usize) {
+        let tx_buffer = self.tx_pool.pop().expect("tx pool should be primed");
+        let rx_buffer = self.rx_pool.pop().expect("rx pool should be primed");
+        submit_pipeline_write(
+            &mut self.board.crypto,
+            self.pipeline_write
+                .as_mut()
+                .expect("pipeline write endpoint should be initialized"),
+            tx,
+            tx_buffer,
+        );
+        submit_pipeline_read(
+            self.pipeline_read
+                .as_mut()
+                .expect("pipeline read endpoint should be initialized"),
+            rx_buffer,
+            request_bytes,
+        );
+    }
+
+    fn discard_window_pending_transfers(&mut self) {
+        const DRAIN_TIMEOUT: Duration = Duration::from_millis(10);
+
+        if let Some(endpoint) = self.pipeline_write.as_mut() {
+            endpoint.cancel_all();
+            while let Some(completion) = endpoint.wait_next_complete(DRAIN_TIMEOUT) {
+                self.tx_pool.push(completion.buffer);
+            }
+        }
+
+        if let Some(endpoint) = self.pipeline_read.as_mut() {
+            endpoint.cancel_all();
+            while let Some(completion) = endpoint.wait_next_complete(DRAIN_TIMEOUT) {
+                self.rx_pool.push(completion.buffer);
+            }
+        }
+    }
+    fn transfer_with_profile(
+        &mut self,
+        tx: &[u16],
+        rx: &mut [u16],
+        profile: Option<&mut TransferStageProfile>,
+    ) -> Result<()> {
+        let mut profiler = TransferProfiler::new(profile, 1);
+
+        let stage_started = Instant::now();
         validate_transfer_buffers(
             tx.len(),
             rx.len(),
             usize::from(self.board.config.fifo_size_words()),
         )?;
         self.board.ensure_mode(BoardMode::VeriComm)?;
+        profiler.add(TransferProfileStage::Validation, stage_started.elapsed());
+
+        let stage_started = Instant::now();
         self.ensure_pipeline_endpoints()?;
 
         let tx_byte_len = std::mem::size_of_val(tx);
@@ -323,7 +499,9 @@ impl IoSession<'_> {
                 .max_packet_size(),
             tx_byte_len,
         );
+        profiler.add(TransferProfileStage::Setup, stage_started.elapsed());
 
+        let stage_started = Instant::now();
         let rx_buffer = self.take_single_rx_buffer(request_bytes);
         submit_pipeline_read(
             self.pipeline_read
@@ -343,8 +521,10 @@ impl IoSession<'_> {
             .as_mut()
             .expect("pipeline write endpoint should be initialized")
             .submit(tx_buffer);
+        profiler.add(TransferProfileStage::Submit, stage_started.elapsed());
 
         let timeout = self.board.transport().usb_timeout;
+        let stage_started = Instant::now();
         let tx_completion = match self
             .pipeline_write
             .as_mut()
@@ -372,7 +552,9 @@ impl IoSession<'_> {
         let tx_buffer = tx_completion.buffer;
         self.single_tx_buffer = Some(tx_buffer);
         tx_status.map_err(|err| transfer_error(err, "nusb_bulk_write"))?;
+        profiler.add(TransferProfileStage::WaitWrite, stage_started.elapsed());
 
+        let stage_started = Instant::now();
         let rx_completion = match self
             .pipeline_read
             .as_mut()
@@ -394,7 +576,9 @@ impl IoSession<'_> {
         let rx_status = rx_completion.status;
         let mut rx_buffer = rx_completion.buffer;
         rx_status.map_err(|err| transfer_error(err, "nusb_bulk_read"))?;
+        profiler.add(TransferProfileStage::WaitRead, stage_started.elapsed());
 
+        let stage_started = Instant::now();
         if actual_len < tx_byte_len {
             self.single_rx_buffer = Some(rx_buffer);
             return Err(Error::UnexpectedResponse(
@@ -406,35 +590,56 @@ impl IoSession<'_> {
             .decrypt_words(bytes_as_words_mut(&mut rx_buffer[..tx_byte_len]));
         rx.copy_from_slice(bytes_as_words(&rx_buffer[..tx_byte_len]));
         self.single_rx_buffer = Some(rx_buffer);
+        profiler.add(TransferProfileStage::DecodeCopy, stage_started.elapsed());
         Ok(())
     }
 
-    fn transfer_batch_slices(
+    pub fn transfer(&mut self, tx: &[u16], rx: &mut [u16]) -> Result<()> {
+        self.transfer_with_profile(tx, rx, None)
+    }
+
+    pub fn transfer_profiled_into(
+        &mut self,
+        tx: &[u16],
+        rx: &mut [u16],
+    ) -> Result<TransferStageProfile> {
+        let mut profile = TransferStageProfile::default();
+        self.transfer_with_profile(tx, rx, Some(&mut profile))?;
+        Ok(profile)
+    }
+
+    fn transfer_batch_into_slices_with_profile(
         &mut self,
         txs: &[&[u16]],
-        rx_lengths: &[usize],
-    ) -> Result<Vec<Vec<u16>>> {
-        if txs.len() != rx_lengths.len() {
+        outputs: &mut [&mut [u16]],
+        profile: Option<&mut TransferStageProfile>,
+    ) -> Result<()> {
+        let mut profiler = TransferProfiler::new(profile, txs.len());
+
+        let stage_started = Instant::now();
+        if txs.len() != outputs.len() {
             return Err(Error::InvalidBufferLength {
                 context: "vericomm batch transfer",
                 expected: txs.len(),
-                actual: rx_lengths.len(),
+                actual: outputs.len(),
             });
         }
         self.board.ensure_mode(BoardMode::VeriComm)?;
 
-        for (tx, rx_len) in txs.iter().zip(rx_lengths.iter().copied()) {
+        for (tx, output) in txs.iter().zip(outputs.iter()) {
             validate_transfer_buffers(
                 tx.len(),
-                rx_len,
+                output.len(),
                 usize::from(self.board.config.fifo_size_words()),
             )?;
         }
 
         if txs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
+        profiler.add(TransferProfileStage::Validation, stage_started.elapsed());
 
+        let stage_started = Instant::now();
         self.ensure_pipeline_endpoints()?;
 
         let max_packet_size = self
@@ -451,14 +656,12 @@ impl IoSession<'_> {
         let max_request_bytes = request_bytes.iter().copied().max().unwrap_or(0);
         let pipeline_depth = txs.len().min(MAX_PIPELINE_DEPTH);
         self.prepare_pools(pipeline_depth, max_bytes, max_request_bytes);
-        let mut outputs = rx_lengths
-            .iter()
-            .map(|len| vec![0u16; *len])
-            .collect::<Vec<_>>();
+        profiler.add(TransferProfileStage::Setup, stage_started.elapsed());
 
         let mut submitted = 0usize;
         let mut completed = 0usize;
 
+        let stage_started = Instant::now();
         while submitted < pipeline_depth {
             let tx_buffer = self.tx_pool.pop().expect("tx pool should be primed");
             let rx_buffer = self.rx_pool.pop().expect("rx pool should be primed");
@@ -479,8 +682,10 @@ impl IoSession<'_> {
             );
             submitted += 1;
         }
+        profiler.add(TransferProfileStage::Submit, stage_started.elapsed());
 
         while completed < txs.len() {
+            let stage_started = Instant::now();
             let write_completion = self
                 .pipeline_write
                 .as_mut()
@@ -491,7 +696,9 @@ impl IoSession<'_> {
                 .status
                 .map_err(|err| transfer_error(err, "pipeline_write"))?;
             self.tx_pool.push(write_completion.buffer);
+            profiler.add(TransferProfileStage::WaitWrite, stage_started.elapsed());
 
+            let stage_started = Instant::now();
             let read_completion = self
                 .pipeline_read
                 .as_mut()
@@ -503,19 +710,24 @@ impl IoSession<'_> {
                 .map_err(|err| transfer_error(err, "pipeline_read"))?;
             let actual_len = read_completion.actual_len;
             let read_buffer = read_completion.buffer;
+            profiler.add(TransferProfileStage::WaitRead, stage_started.elapsed());
 
-            let expected_bytes = outputs[completed].len() * std::mem::size_of::<u16>();
+            let stage_started = Instant::now();
+            let output = &mut *outputs[completed];
+            let expected_bytes = std::mem::size_of_val(output);
             if actual_len < expected_bytes {
                 return Err(Error::UnexpectedResponse(
                     "pipeline read returned short payload",
                 ));
             }
-            bytes_into_words(&read_buffer[..expected_bytes], &mut outputs[completed]);
-            self.board.crypto.decrypt_words(&mut outputs[completed]);
+            bytes_into_words(&read_buffer[..expected_bytes], output);
+            self.board.crypto.decrypt_words(output);
             self.rx_pool.push(read_buffer);
             completed += 1;
+            profiler.add(TransferProfileStage::DecodeCopy, stage_started.elapsed());
 
             if submitted < txs.len() {
+                let stage_started = Instant::now();
                 let tx_buffer = self
                     .tx_pool
                     .pop()
@@ -540,9 +752,27 @@ impl IoSession<'_> {
                     request_bytes[submitted],
                 );
                 submitted += 1;
+                profiler.add(TransferProfileStage::RefillSubmit, stage_started.elapsed());
             }
         }
 
+        Ok(())
+    }
+
+    fn transfer_batch_slices(
+        &mut self,
+        txs: &[&[u16]],
+        rx_lengths: &[usize],
+    ) -> Result<Vec<Vec<u16>>> {
+        let mut outputs = rx_lengths
+            .iter()
+            .map(|len| vec![0u16; *len])
+            .collect::<Vec<_>>();
+        let mut output_refs = outputs
+            .iter_mut()
+            .map(Vec::as_mut_slice)
+            .collect::<Vec<_>>();
+        self.transfer_batch_into_slices_with_profile(txs, &mut output_refs, None)?;
         Ok(outputs)
     }
 
@@ -561,20 +791,17 @@ impl IoSession<'_> {
         txs: &[&[u16]],
         outputs: &mut [&mut [u16]],
     ) -> Result<()> {
-        if txs.len() != outputs.len() {
-            return Err(Error::InvalidBufferLength {
-                context: "vericomm batch in-place transfer",
-                expected: txs.len(),
-                actual: outputs.len(),
-            });
-        }
+        self.transfer_batch_into_slices_with_profile(txs, outputs, None)
+    }
 
-        let rx_lengths = outputs.iter().map(|out| out.len()).collect::<Vec<_>>();
-        let results = self.transfer_batch_slices(txs, &rx_lengths)?;
-        for (result, out) in results.into_iter().zip(outputs.iter_mut()) {
-            out.copy_from_slice(&result);
-        }
-        Ok(())
+    pub fn transfer_batch_into_profiled(
+        &mut self,
+        txs: &[&[u16]],
+        outputs: &mut [&mut [u16]],
+    ) -> Result<TransferStageProfile> {
+        let mut profile = TransferStageProfile::default();
+        self.transfer_batch_into_slices_with_profile(txs, outputs, Some(&mut profile))?;
+        Ok(profile)
     }
 
     pub fn finish(mut self) -> Result<()> {
@@ -588,6 +815,167 @@ impl Drop for IoSession<'_> {
     fn drop(&mut self) {
         if !self.finished {
             let _ = self.cleanup();
+        }
+    }
+}
+
+impl<'session, 'board> IoTransferWindow<'session, 'board> {
+    fn submit_with_profile(
+        &mut self,
+        tx: &[u16],
+        profile: Option<&mut TransferStageProfile>,
+    ) -> Result<()> {
+        if self.is_full() {
+            return Err(Error::PipelineFull {
+                capacity: self.capacity,
+            });
+        }
+
+        let mut profiler = TransferProfiler::new(profile, 1);
+
+        let stage_started = Instant::now();
+        validate_transfer_buffers(
+            tx.len(),
+            tx.len(),
+            usize::from(self.io.board.config.fifo_size_words()),
+        )?;
+        self.io.board.ensure_mode(BoardMode::VeriComm)?;
+        profiler.add(TransferProfileStage::Validation, stage_started.elapsed());
+
+        let stage_started = Instant::now();
+        self.io.ensure_pipeline_endpoints()?;
+        let tx_byte_len = std::mem::size_of_val(tx);
+        let request_bytes = request_bytes_for_words(
+            self.io
+                .pipeline_read
+                .as_ref()
+                .expect("pipeline read endpoint should be initialized")
+                .max_packet_size(),
+            tx.len(),
+        );
+        self.io.prepare_pools(1, tx_byte_len, request_bytes);
+        profiler.add(TransferProfileStage::Setup, stage_started.elapsed());
+
+        let stage_started = Instant::now();
+        self.io.submit_window_transfer(tx, request_bytes);
+        self.pending_words.push_back(tx.len());
+        profiler.add(TransferProfileStage::Submit, stage_started.elapsed());
+        Ok(())
+    }
+
+    fn receive_into_with_profile(
+        &mut self,
+        output: &mut [u16],
+        profile: Option<&mut TransferStageProfile>,
+    ) -> Result<()> {
+        let Some(expected_words) = self.pending_words.front().copied() else {
+            return Err(Error::PipelineEmpty);
+        };
+
+        if output.len() != expected_words {
+            return Err(Error::InvalidBufferLength {
+                context: "vericomm transfer window receive",
+                expected: expected_words,
+                actual: output.len(),
+            });
+        }
+
+        let mut profiler = TransferProfiler::borrow(profile);
+
+        let stage_started = Instant::now();
+        let write_completion = self
+            .io
+            .pipeline_write
+            .as_mut()
+            .expect("pipeline write endpoint should be initialized")
+            .wait_next_complete(self.io.board.transport().usb_timeout)
+            .ok_or(Error::Timeout("pipeline_write"))?;
+        write_completion
+            .status
+            .map_err(|err| transfer_error(err, "pipeline_write"))?;
+        self.io.tx_pool.push(write_completion.buffer);
+        profiler.add(TransferProfileStage::WaitWrite, stage_started.elapsed());
+
+        let stage_started = Instant::now();
+        let read_completion = self
+            .io
+            .pipeline_read
+            .as_mut()
+            .expect("pipeline read endpoint should be initialized")
+            .wait_next_complete(self.io.board.transport().usb_timeout)
+            .ok_or(Error::Timeout("pipeline_read"))?;
+        read_completion
+            .status
+            .map_err(|err| transfer_error(err, "pipeline_read"))?;
+        let actual_len = read_completion.actual_len;
+        let read_buffer = read_completion.buffer;
+        profiler.add(TransferProfileStage::WaitRead, stage_started.elapsed());
+
+        let stage_started = Instant::now();
+        let expected_bytes = std::mem::size_of_val(output);
+        if actual_len < expected_bytes {
+            return Err(Error::UnexpectedResponse(
+                "pipeline read returned short payload",
+            ));
+        }
+        bytes_into_words(&read_buffer[..expected_bytes], output);
+        self.io.board.crypto.decrypt_words(output);
+        self.io.rx_pool.push(read_buffer);
+        self.pending_words.pop_front();
+        profiler.add(TransferProfileStage::DecodeCopy, stage_started.elapsed());
+        Ok(())
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn pending(&self) -> usize {
+        self.pending_words.len()
+    }
+
+    pub fn available(&self) -> usize {
+        self.capacity.saturating_sub(self.pending())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending_words.is_empty()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.pending() >= self.capacity
+    }
+
+    /// Queues one transfer into the rolling window.
+    pub fn submit(&mut self, tx: &[u16]) -> Result<()> {
+        self.submit_with_profile(tx, None)
+    }
+
+    /// Queues one transfer and returns a stage profile for that submission.
+    pub fn submit_profiled(&mut self, tx: &[u16]) -> Result<TransferStageProfile> {
+        let mut profile = TransferStageProfile::default();
+        self.submit_with_profile(tx, Some(&mut profile))?;
+        Ok(profile)
+    }
+
+    /// Retires the oldest in-flight transfer into `output`.
+    pub fn receive_into(&mut self, output: &mut [u16]) -> Result<()> {
+        self.receive_into_with_profile(output, None)
+    }
+
+    /// Retires the oldest in-flight transfer and returns its stage profile.
+    pub fn receive_into_profiled(&mut self, output: &mut [u16]) -> Result<TransferStageProfile> {
+        let mut profile = TransferStageProfile::default();
+        self.receive_into_with_profile(output, Some(&mut profile))?;
+        Ok(profile)
+    }
+}
+
+impl Drop for IoTransferWindow<'_, '_> {
+    fn drop(&mut self) {
+        if !self.pending_words.is_empty() {
+            self.io.discard_window_pending_transfers();
+            self.pending_words.clear();
         }
     }
 }
@@ -931,6 +1319,24 @@ mod tests {
     fn io_session_struct_caches_endpoint_adapters() {
         let type_name = std::any::type_name::<super::IoSession<'_>>();
         assert!(type_name.contains("IoSession"));
+    }
+
+    #[test]
+    fn io_transfer_window_type_is_stable() {
+        let type_name = std::any::type_name::<super::IoTransferWindow<'_, '_>>();
+        assert!(type_name.contains("IoTransferWindow"));
+    }
+
+    #[test]
+    fn pipeline_error_shapes_are_stable() {
+        assert_eq!(
+            Error::PipelineEmpty.to_string(),
+            "transfer pipeline has no pending transfers"
+        );
+        assert_eq!(
+            Error::PipelineFull { capacity: 4 }.to_string(),
+            "transfer pipeline is full (capacity 4 outstanding transfers)"
+        );
     }
 
     use super::{Board, BoardMode, CryptoState, IoConfig, validate_transfer_buffers};
