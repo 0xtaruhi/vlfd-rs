@@ -4,7 +4,9 @@ use crate::error::{Error, Result};
 use crate::usb::{Endpoint, TransportConfig, UsbDevice};
 use nusb::{
     Endpoint as UsbEndpoint,
-    transfer::{Buffer, Bulk, Completion, EndpointDirection, In, Out},
+    transfer::{
+        Buffer, Bulk, Completion, EndpointDirection, In, Out, TransferError as UsbTransferError,
+    },
 };
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -329,14 +331,50 @@ pub struct IoSession<'a> {
 /// A rolling VeriComm pipeline that keeps up to `capacity` transfers in flight.
 ///
 /// Submit frames with [`Self::submit`] and retire them in order with
-/// [`Self::receive_into`]. Dropping the window cancels any remaining
-/// transfers and recycles their buffers back into the parent [`IoSession`].
+/// [`Self::receive_into`]. All in-flight transfers in one window must use the
+/// same word length; drain the window before changing frame size. Dropping the
+/// window cancels any remaining transfers and recycles their buffers back into
+/// the parent [`IoSession`].
 pub struct IoTransferWindow<'session, 'board> {
     io: &'session mut IoSession<'board>,
     capacity: usize,
-    pending_words: VecDeque<usize>,
+    pending_transfers: VecDeque<PendingWindowTransfer>,
     pending_writes: usize,
     pending_reads: usize,
+}
+
+#[derive(Debug)]
+struct PendingWindowTransfer {
+    words: usize,
+    tx_buffer_id: usize,
+    rx_buffer_id: usize,
+    write_completion: Option<WindowWriteCompletion>,
+    read_completion: Option<WindowReadCompletion>,
+}
+
+impl PendingWindowTransfer {
+    fn new(words: usize, tx_buffer: &Buffer, rx_buffer: &Buffer) -> Self {
+        Self {
+            words,
+            tx_buffer_id: buffer_identity(tx_buffer),
+            rx_buffer_id: buffer_identity(rx_buffer),
+            write_completion: None,
+            read_completion: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WindowWriteCompletion {
+    buffer: Buffer,
+    status: std::result::Result<(), UsbTransferError>,
+}
+
+#[derive(Debug)]
+struct WindowReadCompletion {
+    buffer: Buffer,
+    actual_len: usize,
+    status: std::result::Result<(), UsbTransferError>,
 }
 
 impl<'a> IoSession<'a> {
@@ -432,15 +470,20 @@ impl<'a> IoSession<'a> {
         Ok(IoTransferWindow {
             io: self,
             capacity: capacity.min(MAX_PIPELINE_DEPTH),
-            pending_words: VecDeque::with_capacity(capacity.min(MAX_PIPELINE_DEPTH)),
+            pending_transfers: VecDeque::with_capacity(capacity.min(MAX_PIPELINE_DEPTH)),
             pending_writes: 0,
             pending_reads: 0,
         })
     }
 
-    fn submit_window_transfer(&mut self, tx: &[u16], request_bytes: usize) {
+    fn submit_window_transfer(
+        &mut self,
+        tx: &[u16],
+        request_bytes: usize,
+    ) -> PendingWindowTransfer {
         let tx_buffer = self.tx_pool.pop().expect("tx pool should be primed");
         let rx_buffer = self.rx_pool.pop().expect("rx pool should be primed");
+        let pending_transfer = PendingWindowTransfer::new(tx.len(), &tx_buffer, &rx_buffer);
         submit_pipeline_write(
             &mut self.board.crypto,
             self.pipeline_write
@@ -456,6 +499,7 @@ impl<'a> IoSession<'a> {
             rx_buffer,
             request_bytes,
         );
+        pending_transfer
     }
 
     fn discard_window_pending_transfers(&mut self, pending_writes: usize, pending_reads: usize) {
@@ -846,6 +890,12 @@ impl<'session, 'board> IoTransferWindow<'session, 'board> {
         let mut profiler = TransferProfiler::new(profile, 1);
 
         let stage_started = Instant::now();
+        validate_window_transfer_words(
+            self.pending_transfers
+                .front()
+                .map(|transfer| transfer.words),
+            tx.len(),
+        )?;
         validate_transfer_buffers(
             tx.len(),
             tx.len(),
@@ -869,8 +919,8 @@ impl<'session, 'board> IoTransferWindow<'session, 'board> {
         profiler.add(TransferProfileStage::Setup, stage_started.elapsed());
 
         let stage_started = Instant::now();
-        self.io.submit_window_transfer(tx, request_bytes);
-        self.pending_words.push_back(tx.len());
+        let pending_transfer = self.io.submit_window_transfer(tx, request_bytes);
+        self.pending_transfers.push_back(pending_transfer);
         self.pending_writes += 1;
         self.pending_reads += 1;
         profiler.add(TransferProfileStage::Submit, stage_started.elapsed());
@@ -882,7 +932,11 @@ impl<'session, 'board> IoTransferWindow<'session, 'board> {
         output: &mut [u16],
         profile: Option<&mut TransferStageProfile>,
     ) -> Result<()> {
-        let Some(expected_words) = self.pending_words.front().copied() else {
+        let Some(expected_words) = self
+            .pending_transfers
+            .front()
+            .map(|transfer| transfer.words)
+        else {
             return Err(Error::PipelineEmpty);
         };
 
@@ -897,43 +951,43 @@ impl<'session, 'board> IoTransferWindow<'session, 'board> {
         let mut profiler = TransferProfiler::borrow(profile);
 
         let stage_started = Instant::now();
-        let write_completion = self
-            .io
-            .pipeline_write
-            .as_mut()
-            .expect("pipeline write endpoint should be initialized")
-            .wait_next_complete(self.io.board.transport().usb_timeout)
-            .ok_or(Error::Timeout("pipeline_write"))?;
-        self.pending_writes = self.pending_writes.saturating_sub(1);
-        let write_status = write_completion.status;
-        self.io.tx_pool.push(write_completion.buffer);
-        write_status.map_err(|err| transfer_error(err, "pipeline_write"))?;
+        self.collect_oldest_write_completion()?;
         profiler.add(TransferProfileStage::WaitWrite, stage_started.elapsed());
 
         let stage_started = Instant::now();
-        let read_completion = self
-            .io
-            .pipeline_read
-            .as_mut()
-            .expect("pipeline read endpoint should be initialized")
-            .wait_next_complete(self.io.board.transport().usb_timeout)
-            .ok_or(Error::Timeout("pipeline_read"))?;
-        self.pending_reads = self.pending_reads.saturating_sub(1);
+        self.collect_oldest_read_completion()?;
+        profiler.add(TransferProfileStage::WaitRead, stage_started.elapsed());
+
+        let stage_started = Instant::now();
+        let mut transfer = self
+            .pending_transfers
+            .pop_front()
+            .expect("front transfer should be present after completion");
+        let write_completion = transfer
+            .write_completion
+            .take()
+            .expect("front transfer should have a write completion");
+        let read_completion = transfer
+            .read_completion
+            .take()
+            .expect("front transfer should have a read completion");
+        let write_status = write_completion.status;
+        self.io.tx_pool.push(write_completion.buffer);
+        if let Err(err) = write_status {
+            self.io.rx_pool.push(read_completion.buffer);
+            return Err(transfer_error(err, "pipeline_write"));
+        }
+
         let actual_len = read_completion.actual_len;
         let read_status = read_completion.status;
         let read_buffer = read_completion.buffer;
         if let Err(err) = read_status {
             self.io.rx_pool.push(read_buffer);
-            self.pending_words.pop_front();
             return Err(transfer_error(err, "pipeline_read"));
         }
-        profiler.add(TransferProfileStage::WaitRead, stage_started.elapsed());
-
-        let stage_started = Instant::now();
         let expected_bytes = std::mem::size_of_val(output);
         if actual_len < expected_bytes {
             self.io.rx_pool.push(read_buffer);
-            self.pending_words.pop_front();
             return Err(Error::UnexpectedResponse(
                 "pipeline read returned short payload",
             ));
@@ -941,9 +995,69 @@ impl<'session, 'board> IoTransferWindow<'session, 'board> {
         bytes_into_words(&read_buffer[..expected_bytes], output);
         self.io.board.crypto.decrypt_words(output);
         self.io.rx_pool.push(read_buffer);
-        self.pending_words.pop_front();
         profiler.add(TransferProfileStage::DecodeCopy, stage_started.elapsed());
         Ok(())
+    }
+
+    fn collect_oldest_write_completion(&mut self) -> Result<()> {
+        while self
+            .pending_transfers
+            .front()
+            .map(|transfer| transfer.write_completion.is_none())
+            .unwrap_or(false)
+        {
+            let completion = self
+                .io
+                .pipeline_write
+                .as_mut()
+                .expect("pipeline write endpoint should be initialized")
+                .wait_next_complete(self.io.board.transport().usb_timeout)
+                .ok_or(Error::Timeout("pipeline_write"))?;
+            self.pending_writes = self.pending_writes.saturating_sub(1);
+            store_window_write_completion(&mut self.pending_transfers, completion)?;
+        }
+        Ok(())
+    }
+
+    fn collect_oldest_read_completion(&mut self) -> Result<()> {
+        while self
+            .pending_transfers
+            .front()
+            .map(|transfer| transfer.read_completion.is_none())
+            .unwrap_or(false)
+        {
+            let completion = self
+                .io
+                .pipeline_read
+                .as_mut()
+                .expect("pipeline read endpoint should be initialized")
+                .wait_next_complete(self.io.board.transport().usb_timeout)
+                .ok_or(Error::Timeout("pipeline_read"))?;
+            self.pending_reads = self.pending_reads.saturating_sub(1);
+            store_window_read_completion(&mut self.pending_transfers, completion)?;
+        }
+        Ok(())
+    }
+
+    fn recycle_completed_buffers(&mut self) -> (usize, usize) {
+        let mut pending_writes = 0usize;
+        let mut pending_reads = 0usize;
+
+        while let Some(mut transfer) = self.pending_transfers.pop_front() {
+            if let Some(completion) = transfer.write_completion.take() {
+                self.io.tx_pool.push(completion.buffer);
+            } else {
+                pending_writes += 1;
+            }
+
+            if let Some(completion) = transfer.read_completion.take() {
+                self.io.rx_pool.push(completion.buffer);
+            } else {
+                pending_reads += 1;
+            }
+        }
+
+        (pending_writes, pending_reads)
     }
 
     pub fn capacity(&self) -> usize {
@@ -951,7 +1065,7 @@ impl<'session, 'board> IoTransferWindow<'session, 'board> {
     }
 
     pub fn pending(&self) -> usize {
-        self.pending_words.len()
+        self.pending_transfers.len()
     }
 
     pub fn available(&self) -> usize {
@@ -959,7 +1073,7 @@ impl<'session, 'board> IoTransferWindow<'session, 'board> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pending_words.is_empty()
+        self.pending_transfers.is_empty()
     }
 
     pub fn is_full(&self) -> bool {
@@ -993,10 +1107,10 @@ impl<'session, 'board> IoTransferWindow<'session, 'board> {
 
 impl Drop for IoTransferWindow<'_, '_> {
     fn drop(&mut self) {
-        if !self.pending_words.is_empty() {
+        if !self.pending_transfers.is_empty() {
+            let (pending_writes, pending_reads) = self.recycle_completed_buffers();
             self.io
-                .discard_window_pending_transfers(self.pending_writes, self.pending_reads);
-            self.pending_words.clear();
+                .discard_window_pending_transfers(pending_writes, pending_reads);
             self.pending_writes = 0;
             self.pending_reads = 0;
         }
@@ -1183,6 +1297,23 @@ fn validate_transfer_buffers(
     Ok(())
 }
 
+fn validate_window_transfer_words(
+    expected_words: Option<usize>,
+    actual_words: usize,
+) -> Result<()> {
+    if let Some(expected_words) = expected_words {
+        if expected_words != actual_words {
+            return Err(Error::InvalidBufferLength {
+                context: "vericomm transfer window in-flight word length",
+                expected: expected_words,
+                actual: actual_words,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 pub(crate) fn bitstream_chunk_words(config: &Config) -> Result<usize> {
     let fifo_words = usize::from(config.fifo_size_words());
     if fifo_words == 0 {
@@ -1217,6 +1348,65 @@ fn batch_request_lengths(max_packet_size: usize, txs: &[&[u16]]) -> Vec<usize> {
 
 fn discard_undersized_buffers(pool: &mut Vec<Buffer>, min_capacity: usize) {
     pool.retain(|buffer| buffer.capacity() >= min_capacity);
+}
+
+fn buffer_identity(buffer: &Buffer) -> usize {
+    buffer.as_ptr() as usize
+}
+
+fn store_window_write_completion(
+    pending_transfers: &mut VecDeque<PendingWindowTransfer>,
+    completion: Completion,
+) -> Result<()> {
+    let buffer_id = buffer_identity(&completion.buffer);
+    let Some(transfer) = pending_transfers
+        .iter_mut()
+        .find(|transfer| transfer.tx_buffer_id == buffer_id)
+    else {
+        return Err(Error::UnexpectedResponse(
+            "pipeline write completion did not match a pending transfer",
+        ));
+    };
+
+    if transfer.write_completion.is_some() {
+        return Err(Error::UnexpectedResponse(
+            "pipeline write completion matched an already completed transfer",
+        ));
+    }
+
+    transfer.write_completion = Some(WindowWriteCompletion {
+        buffer: completion.buffer,
+        status: completion.status,
+    });
+    Ok(())
+}
+
+fn store_window_read_completion(
+    pending_transfers: &mut VecDeque<PendingWindowTransfer>,
+    completion: Completion,
+) -> Result<()> {
+    let buffer_id = buffer_identity(&completion.buffer);
+    let Some(transfer) = pending_transfers
+        .iter_mut()
+        .find(|transfer| transfer.rx_buffer_id == buffer_id)
+    else {
+        return Err(Error::UnexpectedResponse(
+            "pipeline read completion did not match a pending transfer",
+        ));
+    };
+
+    if transfer.read_completion.is_some() {
+        return Err(Error::UnexpectedResponse(
+            "pipeline read completion matched an already completed transfer",
+        ));
+    }
+
+    transfer.read_completion = Some(WindowReadCompletion {
+        buffer: completion.buffer,
+        actual_len: completion.actual_len,
+        status: completion.status,
+    });
+    Ok(())
 }
 
 fn submit_pipeline_write(
@@ -1326,6 +1516,100 @@ mod tests {
     }
 
     #[test]
+    fn rolling_window_matches_write_completions_by_buffer_identity() {
+        let tx_a = Buffer::from(vec![0u8; 512]);
+        let rx_a = Buffer::from(vec![0u8; 512]);
+        let tx_b = Buffer::from(vec![0u8; 1024]);
+        let rx_b = Buffer::from(vec![0u8; 1024]);
+        let tx_a_id = super::buffer_identity(&tx_a);
+        let tx_b_id = super::buffer_identity(&tx_b);
+        let mut pending = VecDeque::from([
+            super::PendingWindowTransfer::new(256, &tx_a, &rx_a),
+            super::PendingWindowTransfer::new(512, &tx_b, &rx_b),
+        ]);
+
+        super::store_window_write_completion(
+            &mut pending,
+            nusb::transfer::Completion {
+                buffer: tx_b,
+                actual_len: 1024,
+                status: Ok(()),
+            },
+        )
+        .expect("completion should match the second transfer");
+
+        assert!(pending[0].write_completion.is_none());
+        assert_eq!(pending[1].tx_buffer_id, tx_b_id);
+        assert_eq!(
+            super::buffer_identity(&pending[1].write_completion.as_ref().unwrap().buffer),
+            tx_b_id
+        );
+
+        super::store_window_write_completion(
+            &mut pending,
+            nusb::transfer::Completion {
+                buffer: tx_a,
+                actual_len: 512,
+                status: Ok(()),
+            },
+        )
+        .expect("completion should match the first transfer");
+
+        assert_eq!(pending[0].tx_buffer_id, tx_a_id);
+        assert_eq!(
+            super::buffer_identity(&pending[0].write_completion.as_ref().unwrap().buffer),
+            tx_a_id
+        );
+    }
+
+    #[test]
+    fn rolling_window_matches_read_completions_by_buffer_identity() {
+        let tx_a = Buffer::from(vec![0u8; 512]);
+        let rx_a = Buffer::from(vec![0u8; 512]);
+        let tx_b = Buffer::from(vec![0u8; 1024]);
+        let rx_b = Buffer::from(vec![0u8; 1024]);
+        let rx_a_id = super::buffer_identity(&rx_a);
+        let rx_b_id = super::buffer_identity(&rx_b);
+        let mut pending = VecDeque::from([
+            super::PendingWindowTransfer::new(256, &tx_a, &rx_a),
+            super::PendingWindowTransfer::new(512, &tx_b, &rx_b),
+        ]);
+
+        super::store_window_read_completion(
+            &mut pending,
+            nusb::transfer::Completion {
+                buffer: rx_b,
+                actual_len: 1024,
+                status: Ok(()),
+            },
+        )
+        .expect("completion should match the second transfer");
+
+        assert!(pending[0].read_completion.is_none());
+        assert_eq!(pending[1].rx_buffer_id, rx_b_id);
+        assert_eq!(
+            super::buffer_identity(&pending[1].read_completion.as_ref().unwrap().buffer),
+            rx_b_id
+        );
+
+        super::store_window_read_completion(
+            &mut pending,
+            nusb::transfer::Completion {
+                buffer: rx_a,
+                actual_len: 512,
+                status: Ok(()),
+            },
+        )
+        .expect("completion should match the first transfer");
+
+        assert_eq!(pending[0].rx_buffer_id, rx_a_id);
+        assert_eq!(
+            super::buffer_identity(&pending[0].read_completion.as_ref().unwrap().buffer),
+            rx_a_id
+        );
+    }
+
+    #[test]
     fn batch_in_place_error_shape_is_stable() {
         let err = Error::InvalidBufferLength {
             context: "vericomm batch in-place transfer",
@@ -1362,9 +1646,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transfer_window_rejects_mixed_in_flight_word_lengths() {
+        let err = super::validate_window_transfer_words(Some(256), 128).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid buffer length for `vericomm transfer window in-flight word length` (expected 256, got 128)"
+        );
+    }
+
     use super::{Board, BoardMode, CryptoState, IoConfig, validate_transfer_buffers};
     use crate::error::Error;
     use crate::usb::TransportConfig;
+    use std::collections::VecDeque;
     use std::time::Duration;
 
     #[test]
