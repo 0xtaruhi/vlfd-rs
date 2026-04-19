@@ -714,7 +714,7 @@ impl<'a> IoSession<'a> {
 
             let stage_started = Instant::now();
             let output = &mut *outputs[completed];
-            let expected_bytes = output.len() * std::mem::size_of::<u16>();
+            let expected_bytes = std::mem::size_of_val(output);
             if actual_len < expected_bytes {
                 return Err(Error::UnexpectedResponse(
                     "pipeline read returned short payload",
@@ -912,7 +912,7 @@ impl<'session, 'board> IoTransferWindow<'session, 'board> {
         profiler.add(TransferProfileStage::WaitRead, stage_started.elapsed());
 
         let stage_started = Instant::now();
-        let expected_bytes = output.len() * std::mem::size_of::<u16>();
+        let expected_bytes = std::mem::size_of_val(output);
         if actual_len < expected_bytes {
             return Err(Error::UnexpectedResponse(
                 "pipeline read returned short payload",
