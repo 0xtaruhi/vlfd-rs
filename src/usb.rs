@@ -185,14 +185,7 @@ impl UsbDevice {
         };
 
         if usb_device.transport.clear_halt_on_open {
-            for endpoint in [
-                Endpoint::FifoWrite,
-                Endpoint::Command,
-                Endpoint::FifoRead,
-                Endpoint::Sync,
-            ] {
-                usb_device.clear_halt(endpoint)?;
-            }
+            usb_device.clear_halt_all()?;
         }
 
         *self = usb_device;
@@ -309,6 +302,18 @@ impl UsbDevice {
             running,
             thread: Some(thread),
         })
+    }
+
+    pub(crate) fn clear_halt_all(&mut self) -> Result<()> {
+        for endpoint in [
+            Endpoint::FifoWrite,
+            Endpoint::Command,
+            Endpoint::FifoRead,
+            Endpoint::Sync,
+        ] {
+            self.clear_halt(endpoint)?;
+        }
+        Ok(())
     }
 
     fn clear_halt(&mut self, endpoint: Endpoint) -> Result<()> {

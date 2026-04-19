@@ -7,6 +7,7 @@ use nusb::{
     transfer::{Buffer, Bulk, Completion, EndpointDirection, In, Out},
 };
 use std::collections::VecDeque;
+use std::thread;
 use std::time::{Duration, Instant};
 
 const CONTROL_COMMAND_PREFIX: u8 = 0x01;
@@ -148,6 +149,17 @@ impl Board {
     }
 
     pub fn initialize(&mut self) -> Result<()> {
+        match self.initialize_once() {
+            Ok(()) => Ok(()),
+            Err(err) if should_retry_initialize(&err) => {
+                self.try_recover_control_plane()?;
+                self.initialize_once()
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn initialize_once(&mut self) -> Result<()> {
         self.read_encrypt_table()?;
         self.crypto.decode_table();
         self.refresh_config()?;
@@ -252,6 +264,19 @@ impl Board {
         self.usb
             .write_bytes(Endpoint::Command, &[CONTROL_COMMAND_PREFIX, 0x00])?;
         self.mode = BoardMode::Control;
+        Ok(())
+    }
+
+    fn engine_reset(&mut self) -> Result<()> {
+        self.usb.write_bytes(Endpoint::Command, &[0x02])?;
+        self.mode = BoardMode::Unknown;
+        Ok(())
+    }
+
+    fn try_recover_control_plane(&mut self) -> Result<()> {
+        self.usb.clear_halt_all()?;
+        self.engine_reset()?;
+        thread::sleep(Duration::from_millis(2));
         Ok(())
     }
 
@@ -375,6 +400,13 @@ impl<'a> IoSession<'a> {
         if let Some(pipeline_read) = self.pipeline_read.as_mut() {
             pipeline_read.cancel_all();
         }
+        self.pipeline_write = None;
+        self.pipeline_read = None;
+        self.single_tx_buffer = None;
+        self.single_rx_buffer = None;
+        self.tx_pool.clear();
+        self.rx_pool.clear();
+        self.board.try_recover_control_plane()?;
         self.board.activate_control()
     }
 
@@ -1190,6 +1222,10 @@ where
     }
 }
 
+fn should_retry_initialize(err: &Error) -> bool {
+    matches!(err, Error::Timeout(_) | Error::Usb { .. })
+}
+
 #[cfg(test)]
 mod tests {
     use nusb::transfer::Buffer;
@@ -1300,6 +1336,22 @@ mod tests {
             super::buffer_identity(&pending[1].completion.as_ref().unwrap().buffer),
             id_b
         );
+    }
+
+    #[test]
+    fn initialize_retry_only_triggers_for_transport_failures() {
+        assert!(super::should_retry_initialize(&Error::Timeout(
+            "sync_delay"
+        )));
+        assert!(super::should_retry_initialize(&Error::Usb {
+            source: Box::new(std::io::Error::other("boom")),
+            context: "nusb_bulk_read",
+        }));
+        assert!(!super::should_retry_initialize(&Error::NotProgrammed));
+        assert!(!super::should_retry_initialize(&Error::VersionMismatch {
+            expected: 0x0220,
+            actual: 0x0000,
+        }));
     }
 
     use super::{Board, BoardMode, CryptoState, IoConfig, validate_transfer_buffers};
