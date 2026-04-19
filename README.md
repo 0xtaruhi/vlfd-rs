@@ -11,6 +11,7 @@ This release redesigns the public API around explicit sessions:
 ## Features
 - Pure-Rust USB transport powered by `nusb`
 - Explicit board / I/O / programming session boundaries
+- Fixed-size rolling transfer windows for sustained VeriComm streaming
 - Reusable-buffer output APIs for lower-allocation I/O paths
 - High-level configuration refresh and write helpers
 - Bitstream upload support for the integrated FPGA programmer
@@ -50,11 +51,13 @@ fn main() -> Result<()> {
 Add the crate to your `Cargo.toml`:
 ```toml
 [dependencies]
-vlfd-rs = "2"
+vlfd-rs = "3"
 ```
 
 ## API Notes
 - This is a breaking release; the old monolithic `Device` API is removed
+- Rolling windows are fixed-size: use `io.transfer_window(words, capacity)?`
+- The old batch transfer helpers are removed in favor of the rolling window API
 - Transport remains blocking from the public API perspective
 - Internally the USB layer uses `nusb` and `MaybeFuture::wait()`
 

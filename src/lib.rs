@@ -1,6 +1,6 @@
 //! # vlfd-rs
 //!
-//! `vlfd-rs` 2.x models the device around explicit sessions instead of a
+//! `vlfd-rs` 3.x models the device around explicit sessions instead of a
 //! single stateful façade. Open a [`Board`] to inspect and configure the
 //! hardware, then create dedicated sessions for I/O or programming.
 //!

@@ -35,7 +35,6 @@ struct Options {
     iterations: usize,
     words: usize,
     window: usize,
-    continuous: bool,
     profile_stages: bool,
     clock_high_delay: u16,
     clock_low_delay: u16,
@@ -49,7 +48,6 @@ impl Default for Options {
             iterations: 100_000,
             words: 512,
             window: 16,
-            continuous: false,
             profile_stages: false,
             clock_high_delay: 11,
             clock_low_delay: 11,
@@ -86,7 +84,6 @@ impl Options {
                 }
                 "--words" => options.words = next_value(&mut args, "--words")?.parse()?,
                 "--window" => options.window = next_value(&mut args, "--window")?.parse()?,
-                "--continuous" => options.continuous = true,
                 "--profile-stages" => options.profile_stages = true,
                 "--clock-high" => {
                     options.clock_high_delay = next_value(&mut args, "--clock-high")?.parse()?
@@ -126,7 +123,7 @@ where
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  cargo run --example bench_transfer -- cpu [--words N] [--iterations N]\n  cargo run --example bench_transfer -- device [--words N] [--iterations N] [--window N] [--continuous] [--profile-stages] [--clock-high N] [--clock-low N] [--usb-timeout-ms N] [--sync-timeout-ms N] [--reset-on-open] [--no-clear-halt]"
+        "Usage:\n  cargo run --example bench_transfer -- cpu [--words N] [--iterations N]\n  cargo run --example bench_transfer -- device [--words N] [--iterations N] [--window N] [--profile-stages] [--clock-high N] [--clock-low N] [--usb-timeout-ms N] [--sync-timeout-ms N] [--reset-on-open] [--no-clear-halt]"
     );
 }
 
@@ -162,7 +159,6 @@ fn run_device_bench(options: &Options) -> Result<(), Box<dyn Error>> {
 
     let template = vec![0x1234u16; options.words];
     let mut rx = vec![0u16; options.words];
-    let templates = vec![template.clone(); options.window];
     let mut outputs = vec![vec![0u16; options.words]; options.window];
     let mut stage_profile = TransferStageProfile::default();
 
@@ -178,8 +174,8 @@ fn run_device_bench(options: &Options) -> Result<(), Box<dyn Error>> {
                 io.transfer(&template, &mut rx)?;
             }
         }
-    } else if options.continuous {
-        let mut window = io.transfer_window(options.window)?;
+    } else {
+        let mut window = io.transfer_window(options.words, options.window)?;
         let initial = options.iterations.min(options.window);
         for _ in 0..initial {
             if options.profile_stages {
@@ -211,26 +207,6 @@ fn run_device_bench(options: &Options) -> Result<(), Box<dyn Error>> {
                 }
                 submitted += 1;
             }
-        }
-    } else {
-        let mut completed = 0usize;
-        while completed < options.iterations {
-            let batch_len = (options.iterations - completed).min(options.window);
-            let tx_refs = templates[..batch_len]
-                .iter()
-                .map(Vec::as_slice)
-                .collect::<Vec<_>>();
-            let mut rx_refs = outputs[..batch_len]
-                .iter_mut()
-                .map(Vec::as_mut_slice)
-                .collect::<Vec<_>>();
-            if options.profile_stages {
-                let profile = io.transfer_batch_into_profiled(&tx_refs, &mut rx_refs)?;
-                stage_profile.merge(&profile);
-            } else {
-                io.transfer_batch_into(&tx_refs, &mut rx_refs)?;
-            }
-            completed += batch_len;
         }
     }
     let elapsed = started.elapsed();
@@ -300,7 +276,6 @@ fn print_stage_profile(profile: &TransferStageProfile, elapsed: Duration) {
         ("wait_write", profile.wait_write),
         ("wait_read", profile.wait_read),
         ("decode_copy", profile.decode_copy),
-        ("refill_submit", profile.refill_submit),
     ] {
         let pct_of_accounted = duration.as_secs_f64() * 100.0 / accounted_secs;
         let pct_of_wall = duration.as_secs_f64() * 100.0 / elapsed_secs;
