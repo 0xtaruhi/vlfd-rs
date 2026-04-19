@@ -335,6 +335,8 @@ pub struct IoTransferWindow<'session, 'board> {
     io: &'session mut IoSession<'board>,
     capacity: usize,
     pending_words: VecDeque<usize>,
+    pending_writes: usize,
+    pending_reads: usize,
 }
 
 impl<'a> IoSession<'a> {
@@ -431,6 +433,8 @@ impl<'a> IoSession<'a> {
             io: self,
             capacity: capacity.min(MAX_PIPELINE_DEPTH),
             pending_words: VecDeque::with_capacity(capacity.min(MAX_PIPELINE_DEPTH)),
+            pending_writes: 0,
+            pending_reads: 0,
         })
     }
 
@@ -454,19 +458,25 @@ impl<'a> IoSession<'a> {
         );
     }
 
-    fn discard_window_pending_transfers(&mut self) {
+    fn discard_window_pending_transfers(&mut self, pending_writes: usize, pending_reads: usize) {
         const DRAIN_TIMEOUT: Duration = Duration::from_millis(10);
 
         if let Some(endpoint) = self.pipeline_write.as_mut() {
             endpoint.cancel_all();
-            while let Some(completion) = endpoint.wait_next_complete(DRAIN_TIMEOUT) {
+            for _ in 0..pending_writes {
+                let Some(completion) = endpoint.wait_next_complete(DRAIN_TIMEOUT) else {
+                    break;
+                };
                 self.tx_pool.push(completion.buffer);
             }
         }
 
         if let Some(endpoint) = self.pipeline_read.as_mut() {
             endpoint.cancel_all();
-            while let Some(completion) = endpoint.wait_next_complete(DRAIN_TIMEOUT) {
+            for _ in 0..pending_reads {
+                let Some(completion) = endpoint.wait_next_complete(DRAIN_TIMEOUT) else {
+                    break;
+                };
                 self.rx_pool.push(completion.buffer);
             }
         }
@@ -861,6 +871,8 @@ impl<'session, 'board> IoTransferWindow<'session, 'board> {
         let stage_started = Instant::now();
         self.io.submit_window_transfer(tx, request_bytes);
         self.pending_words.push_back(tx.len());
+        self.pending_writes += 1;
+        self.pending_reads += 1;
         profiler.add(TransferProfileStage::Submit, stage_started.elapsed());
         Ok(())
     }
@@ -892,6 +904,7 @@ impl<'session, 'board> IoTransferWindow<'session, 'board> {
             .expect("pipeline write endpoint should be initialized")
             .wait_next_complete(self.io.board.transport().usb_timeout)
             .ok_or(Error::Timeout("pipeline_write"))?;
+        self.pending_writes = self.pending_writes.saturating_sub(1);
         let write_status = write_completion.status;
         self.io.tx_pool.push(write_completion.buffer);
         write_status.map_err(|err| transfer_error(err, "pipeline_write"))?;
@@ -905,6 +918,7 @@ impl<'session, 'board> IoTransferWindow<'session, 'board> {
             .expect("pipeline read endpoint should be initialized")
             .wait_next_complete(self.io.board.transport().usb_timeout)
             .ok_or(Error::Timeout("pipeline_read"))?;
+        self.pending_reads = self.pending_reads.saturating_sub(1);
         let actual_len = read_completion.actual_len;
         let read_status = read_completion.status;
         let read_buffer = read_completion.buffer;
@@ -980,8 +994,11 @@ impl<'session, 'board> IoTransferWindow<'session, 'board> {
 impl Drop for IoTransferWindow<'_, '_> {
     fn drop(&mut self) {
         if !self.pending_words.is_empty() {
-            self.io.discard_window_pending_transfers();
+            self.io
+                .discard_window_pending_transfers(self.pending_writes, self.pending_reads);
             self.pending_words.clear();
+            self.pending_writes = 0;
+            self.pending_reads = 0;
         }
     }
 }

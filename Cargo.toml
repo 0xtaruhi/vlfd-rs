@@ -1,6 +1,6 @@
 [package]
 name = "vlfd-rs"
-version = "2.1.1"
+version = "2.1.2"
 edition = "2024"
 rust-version = "1.85"
 description = "Modern Rust driver for the VLFD board"
