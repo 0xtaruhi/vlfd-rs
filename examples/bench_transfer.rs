@@ -4,7 +4,7 @@ use std::{
     process,
     time::{Duration, Instant},
 };
-use vlfd_rs::{Board, IoConfig, TransferStageProfile, TransportConfig};
+use vlfd_rs::{Board, IoConfig, Licence, TransferStageProfile, TransportConfig};
 
 const WORDS_PER_CYCLE: usize = 4;
 
@@ -38,6 +38,7 @@ struct Options {
     profile_stages: bool,
     clock_high_delay: u16,
     clock_low_delay: u16,
+    customer_id: Option<u16>,
     transport: TransportConfig,
 }
 
@@ -51,6 +52,7 @@ impl Default for Options {
             profile_stages: false,
             clock_high_delay: 11,
             clock_low_delay: 11,
+            customer_id: None,
             transport: TransportConfig::default(),
         }
     }
@@ -91,6 +93,10 @@ impl Options {
                 "--clock-low" => {
                     options.clock_low_delay = next_value(&mut args, "--clock-low")?.parse()?
                 }
+                "--customer-id" => {
+                    options.customer_id =
+                        Some(parse_word(&next_value(&mut args, "--customer-id")?)?)
+                }
                 "--usb-timeout-ms" => {
                     let value: u64 = next_value(&mut args, "--usb-timeout-ms")?.parse()?;
                     options.transport.usb_timeout = Duration::from_millis(value);
@@ -121,9 +127,17 @@ where
         .ok_or_else(|| format!("missing value for `{flag}`").into())
 }
 
+fn parse_word(value: &str) -> Result<u16, Box<dyn Error>> {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    Ok(u16::from_str_radix(digits, 16)?)
+}
+
 fn print_usage() {
     eprintln!(
-        "Usage:\n  cargo run --example bench_transfer -- cpu [--words N] [--iterations N]\n  cargo run --example bench_transfer -- device [--words N] [--iterations N] [--window N] [--profile-stages] [--clock-high N] [--clock-low N] [--usb-timeout-ms N] [--sync-timeout-ms N] [--reset-on-open] [--no-clear-halt]"
+        "Usage:\n  cargo run --example bench_transfer -- cpu [--words N] [--iterations N]\n  cargo run --example bench_transfer -- device --customer-id HEX [--words N] [--iterations N] [--window N] [--profile-stages] [--clock-high N] [--clock-low N] [--usb-timeout-ms N] [--sync-timeout-ms N] [--reset-on-open] [--no-clear-halt]"
     );
 }
 
@@ -145,12 +159,15 @@ fn run_cpu_bench(options: &Options) -> Result<(), Box<dyn Error>> {
 }
 
 fn run_device_bench(options: &Options) -> Result<(), Box<dyn Error>> {
+    let customer_id = options
+        .customer_id
+        .ok_or("device mode requires --customer-id HEX")?;
     let mut board = Board::open_with_transport(options.transport)?;
     let max_cycles_per_transfer = usize::from(board.config().fifo_size_words()) / WORDS_PER_CYCLE;
     let mut io = board.configure_io(&IoConfig {
         clock_high_delay: options.clock_high_delay,
         clock_low_delay: options.clock_low_delay,
-        ..IoConfig::default()
+        ..IoConfig::new(Licence::CustomerId(customer_id))
     })?;
 
     if options.window == 0 {

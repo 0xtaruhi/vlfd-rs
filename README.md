@@ -1,13 +1,14 @@
 # vlfd-rs
 
 `vlfd-rs` is a Rust driver for a VeriComm-compatible USB interface board.
-The 3.x API models board access through explicit sessions:
+The 4.x API models board access through explicit sessions:
 
 - `Board`: owns the USB connection and cached device state
 - `IoSession`: handles VeriComm FIFO transfers
 - `ProgramSession`: handles FPGA programming transfers
 - `Programmer`: convenience wrapper for bitstream upload flows
 - `VeriCommFrame`: names the fixture's four-word, 64-lane sample boundary
+- `Licence`: derives a board-specific activation key from caller-owned credentials
 
 ## Features
 - Pure-Rust USB transport powered by `nusb`
@@ -21,11 +22,12 @@ The 3.x API models board access through explicit sessions:
 
 ## Quick Start
 ```rust
-use vlfd_rs::{Board, IoConfig, Result};
+use vlfd_rs::{Board, IoConfig, Licence, Result};
 
 fn main() -> Result<()> {
     let mut board = Board::open()?;
-    let mut io = board.configure_io(&IoConfig::default())?;
+    let customer_id = 0x1234; // Replace with your issued customer identifier.
+    let mut io = board.configure_io(&IoConfig::new(Licence::CustomerId(customer_id)))?;
 
     let tx = vlfd_rs::VeriCommFrame::from_bits(0x1234);
     let rx = io.transfer_frame(tx)?;
@@ -53,11 +55,12 @@ fn main() -> Result<()> {
 Add the crate to your `Cargo.toml`:
 ```toml
 [dependencies]
-vlfd-rs = "3"
+vlfd-rs = "4"
 ```
 
 ## API Notes
 - The old monolithic `Device` API was removed in 3.0
+- 4.0 removes embedded credentials; callers must provide a customer ID or key
 - `Board::open()` requires exactly one connected board; use `Board::enumerate()`
   and `Board::open_selected()` when multiple boards are present
 - Rolling windows are fixed-size: use `io.transfer_window(words, capacity)?`

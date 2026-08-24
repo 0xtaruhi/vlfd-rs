@@ -2,6 +2,7 @@ use crate::VeriCommFrame;
 use crate::config::Config;
 use crate::constants;
 use crate::error::{Error, Result};
+use crate::licence::Licence;
 use crate::usb::{BoardInfo, BoardSelector, Probe};
 use crate::usb::{Endpoint, TransportConfig, UsbDevice};
 use nusb::{
@@ -228,9 +229,8 @@ impl Board {
             return Err(Error::FeatureUnavailable("vericomm"));
         }
 
-        if let Some(licence_key) = settings.licence_key {
-            self.config.set_licence_key(licence_key);
-        }
+        let licence_key = settings.licence.key_for(self.config.security_key());
+        self.config.set_licence_key(licence_key);
         self.config
             .set_vericomm_clock_high_delay(settings.clock_high_delay);
         self.config
@@ -1016,18 +1016,18 @@ pub struct IoConfig {
     pub vericomm_isv: u8,
     pub clock_check_enabled: bool,
     pub mode_selector: u8,
-    pub licence_key: Option<u16>,
+    pub licence: Licence,
 }
 
-impl Default for IoConfig {
-    fn default() -> Self {
+impl IoConfig {
+    pub const fn new(licence: Licence) -> Self {
         Self {
             clock_high_delay: 11,
             clock_low_delay: 11,
             vericomm_isv: 0,
             clock_check_enabled: false,
             mode_selector: 0,
-            licence_key: Some(0xff40),
+            licence,
         }
     }
 }
@@ -1379,6 +1379,7 @@ mod tests {
 
     use super::{Board, BoardMode, CryptoState, IoConfig, validate_transfer_buffers};
     use crate::error::Error;
+    use crate::licence::Licence;
     use crate::usb::TransportConfig;
     use std::collections::VecDeque;
     use std::time::Duration;
@@ -1448,11 +1449,11 @@ mod tests {
     }
 
     #[test]
-    fn io_config_defaults_match_previous_tuning() {
-        let cfg = IoConfig::default();
+    fn io_config_constructor_keeps_protocol_tuning_explicit() {
+        let cfg = IoConfig::new(Licence::CustomerId(0xf805));
         assert_eq!(cfg.clock_high_delay, 11);
         assert_eq!(cfg.clock_low_delay, 11);
-        assert_eq!(cfg.licence_key, Some(0xff40));
+        assert_eq!(cfg.licence, Licence::CustomerId(0xf805));
     }
 
     #[test]
