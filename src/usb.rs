@@ -20,6 +20,80 @@ const INTERFACE: u8 = 0;
 const HOTPLUG_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const IO_BUFFER_SIZE: usize = 16 * 1024;
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UsbLocation {
+    /// Host-controller identifier reported by the operating system.
+    pub bus_id: String,
+    /// Stable physical hub-port path below that controller.
+    pub port_chain: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BoardInfo {
+    pub location: UsbLocation,
+    /// Transient USB address, useful for diagnostics but not stable selection.
+    pub address: u8,
+    /// USB descriptor serial number, when the operating system exposes one.
+    pub serial_number: Option<String>,
+    pub vendor_id: u16,
+    pub product_id: u16,
+}
+
+impl BoardInfo {
+    fn from_device_info(device: &DeviceInfo) -> Self {
+        Self {
+            location: UsbLocation {
+                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+                bus_id: device.bus_id().to_owned(),
+                #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+                bus_id: String::new(),
+                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+                port_chain: device.port_chain().to_vec(),
+                #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+                port_chain: Vec::new(),
+            },
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "windows",
+                target_os = "android"
+            ))]
+            address: device.device_address(),
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "windows",
+                target_os = "android"
+            )))]
+            address: 0,
+            serial_number: device.serial_number().map(str::to_owned),
+            vendor_id: device.vendor_id(),
+            product_id: device.product_id(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum BoardSelector {
+    /// Require exactly one matching VLFD board to be connected.
+    #[default]
+    Only,
+    /// Match the USB descriptor serial number exactly.
+    SerialNumber(String),
+    /// Match a stable physical USB topology location.
+    UsbLocation(UsbLocation),
+}
+
+impl BoardSelector {
+    fn matches(&self, board: &BoardInfo) -> bool {
+        match self {
+            Self::Only => true,
+            Self::SerialNumber(serial) => board.serial_number.as_ref() == Some(serial),
+            Self::UsbLocation(location) => board.location == *location,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportConfig {
     pub usb_timeout: Duration,
@@ -118,6 +192,17 @@ impl Probe {
         &self.transport
     }
 
+    pub fn boards(&self) -> Result<Vec<BoardInfo>> {
+        matching_board_devices(crate::constants::DW_VID, crate::constants::DW_PID).map(|devices| {
+            let mut boards = devices
+                .iter()
+                .map(BoardInfo::from_device_info)
+                .collect::<Vec<_>>();
+            boards.sort();
+            boards
+        })
+    }
+
     pub fn watch<F>(&self, options: HotplugOptions, callback: F) -> Result<HotplugRegistration>
     where
         F: FnMut(HotplugEvent) + Send + 'static,
@@ -150,16 +235,16 @@ impl UsbDevice {
         &self.transport
     }
 
-    pub fn open(&mut self, vid: u16, pid: u16) -> Result<()> {
+    pub fn open_selected(&mut self, vid: u16, pid: u16, selector: &BoardSelector) -> Result<()> {
         if self.is_open() {
             return Ok(());
         }
 
-        let device_info = nusb::list_devices()
-            .wait()
-            .map_err(|err| usb_error(err, "nusb_list_devices"))?
-            .find(|device| device.vendor_id() == vid && device.product_id() == pid)
-            .ok_or(Error::DeviceNotFound { vid, pid })?;
+        let devices = matching_board_devices(vid, pid)?;
+        if devices.is_empty() {
+            return Err(Error::DeviceNotFound { vid, pid });
+        }
+        let device_info = select_device(&devices, selector)?;
 
         let device = device_info
             .open()
@@ -419,6 +504,38 @@ fn matching_devices(options: HotplugOptions) -> Result<Vec<DeviceInfo>> {
         .collect())
 }
 
+fn matching_board_devices(vid: u16, pid: u16) -> Result<Vec<DeviceInfo>> {
+    matching_devices(HotplugOptions {
+        vendor_id: Some(vid),
+        product_id: Some(pid),
+        ..HotplugOptions::default()
+    })
+}
+
+fn select_device<'a>(
+    devices: &'a [DeviceInfo],
+    selector: &BoardSelector,
+) -> Result<&'a DeviceInfo> {
+    select_unique(devices, |device| {
+        selector.matches(&BoardInfo::from_device_info(device))
+    })
+}
+
+fn select_unique<T>(items: &[T], mut predicate: impl FnMut(&T) -> bool) -> Result<&T> {
+    let mut selected = None;
+    let mut matches = 0;
+    for item in items.iter().filter(|item| predicate(item)) {
+        selected = Some(item);
+        matches += 1;
+    }
+
+    match matches {
+        0 => Err(Error::DeviceSelectionNoMatch),
+        1 => Ok(selected.expect("one device matched")),
+        _ => Err(Error::DeviceSelectionAmbiguous { matches }),
+    }
+}
+
 fn words_as_bytes(words: &[u16]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, std::mem::size_of_val(words)) }
 }
@@ -449,7 +566,8 @@ fn io_error(err: std::io::Error, context: &'static str) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::TransportConfig;
+    use super::{BoardInfo, BoardSelector, TransportConfig, UsbLocation};
+    use crate::Error;
     use std::time::Duration;
 
     #[test]
@@ -459,5 +577,46 @@ mod tests {
         assert_eq!(config.sync_timeout, Duration::from_secs(1));
         assert!(!config.reset_on_open);
         assert!(config.clear_halt_on_open);
+    }
+
+    #[test]
+    fn selectors_match_stable_identity_fields() {
+        let board = BoardInfo {
+            location: UsbLocation {
+                bus_id: "usb0".into(),
+                port_chain: vec![2, 4],
+            },
+            address: 7,
+            serial_number: Some("board-a".into()),
+            vendor_id: 0x04b4,
+            product_id: 0x1004,
+        };
+
+        assert!(BoardSelector::Only.matches(&board));
+        assert!(BoardSelector::SerialNumber("board-a".into()).matches(&board));
+        assert!(
+            BoardSelector::UsbLocation(UsbLocation {
+                bus_id: "usb0".into(),
+                port_chain: vec![2, 4],
+            })
+            .matches(&board)
+        );
+        assert!(!BoardSelector::SerialNumber("board-b".into()).matches(&board));
+    }
+
+    #[test]
+    fn selection_rejects_zero_or_multiple_matches() {
+        assert!(matches!(
+            super::select_unique(&[1, 2], |_| false),
+            Err(Error::DeviceSelectionNoMatch)
+        ));
+        assert!(matches!(
+            super::select_unique(&[1, 2], |_| true),
+            Err(Error::DeviceSelectionAmbiguous { matches: 2 })
+        ));
+        assert_eq!(
+            *super::select_unique(&[1, 2], |value| *value == 2).unwrap(),
+            2
+        );
     }
 }

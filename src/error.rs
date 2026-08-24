@@ -8,6 +8,10 @@ pub enum Error {
         vid: u16,
         pid: u16,
     },
+    DeviceSelectionAmbiguous {
+        matches: usize,
+    },
+    DeviceSelectionNoMatch,
     BufferTooLarge {
         context: &'static str,
         max_words: usize,
@@ -53,6 +57,11 @@ impl fmt::Display for Error {
             Error::DeviceNotFound { vid, pid } => {
                 write!(f, "device {vid:#06x}:{pid:#06x} not found")
             }
+            Error::DeviceSelectionAmbiguous { matches } => write!(
+                f,
+                "device selection matched {matches} boards; select one by serial number or USB location"
+            ),
+            Error::DeviceSelectionNoMatch => write!(f, "device selection matched no boards"),
             Error::BufferTooLarge {
                 context,
                 max_words,

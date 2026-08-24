@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use crate::session::Board;
+use crate::usb::BoardSelector;
 use crate::usb::TransportConfig;
 use std::{
     fs::File,
@@ -19,6 +20,19 @@ impl Programmer {
     pub fn open_with_transport(transport: TransportConfig) -> Result<Self> {
         Ok(Self {
             board: Board::open_with_transport(transport)?,
+        })
+    }
+
+    pub fn open_selected(selector: &BoardSelector) -> Result<Self> {
+        Self::open_selected_with_transport(selector, TransportConfig::default())
+    }
+
+    pub fn open_selected_with_transport(
+        selector: &BoardSelector,
+        transport: TransportConfig,
+    ) -> Result<Self> {
+        Ok(Self {
+            board: Board::open_selected_with_transport(selector, transport)?,
         })
     }
 
