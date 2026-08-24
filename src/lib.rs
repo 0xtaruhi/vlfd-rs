@@ -5,15 +5,15 @@
 //! hardware, then create dedicated sessions for I/O or programming.
 //!
 //! ```no_run
-//! use vlfd_rs::{Board, IoConfig, Result};
+//! use vlfd_rs::{Board, IoConfig, Result, VeriCommFrame};
 //!
 //! fn main() -> Result<()> {
 //!     let mut board = Board::open()?;
 //!     let mut io = board.configure_io(&IoConfig::default())?;
 //!
-//!     let tx = [0x1234u16; 4];
-//!     let mut rx = [0u16; 4];
-//!     io.transfer_into(&tx, &mut rx)?;
+//!     let tx = VeriCommFrame::from_bits(0x1234);
+//!     let rx = io.transfer_frame(tx)?;
+//!     assert_eq!(rx.words().len(), VeriCommFrame::WORDS);
 //!     io.finish()?;
 //!     Ok(())
 //! }
@@ -35,17 +35,19 @@ pub mod constants;
 
 mod config;
 mod error;
+mod frame;
 mod program;
 mod session;
 mod usb;
 
 pub use config::Config;
 pub use error::{Error, Result};
+pub use frame::VeriCommFrame;
 pub use program::{Programmer, load_bitfile, load_bitfile_from_reader};
 pub use session::{
     Board, BoardMode, IoConfig, IoSession, IoTransferWindow, ProgramSession, TransferStageProfile,
 };
 pub use usb::{
-    HotplugDeviceInfo, HotplugEvent, HotplugEventKind, HotplugOptions, HotplugRegistration, Probe,
-    TransportConfig,
+    BoardInfo, BoardSelector, HotplugDeviceInfo, HotplugEvent, HotplugEventKind, HotplugOptions,
+    HotplugRegistration, Probe, TransportConfig, UsbLocation,
 };

@@ -1,6 +1,8 @@
+use crate::VeriCommFrame;
 use crate::config::Config;
 use crate::constants;
 use crate::error::{Error, Result};
+use crate::usb::{BoardInfo, BoardSelector, Probe};
 use crate::usb::{Endpoint, TransportConfig, UsbDevice};
 use nusb::{
     Endpoint as UsbEndpoint,
@@ -113,13 +115,28 @@ pub struct Board {
 }
 
 impl Board {
+    pub fn enumerate() -> Result<Vec<BoardInfo>> {
+        Probe::new().boards()
+    }
+
     pub fn open() -> Result<Self> {
         Self::open_with_transport(TransportConfig::default())
     }
 
     pub fn open_with_transport(transport: TransportConfig) -> Result<Self> {
+        Self::open_selected_with_transport(&BoardSelector::Only, transport)
+    }
+
+    pub fn open_selected(selector: &BoardSelector) -> Result<Self> {
+        Self::open_selected_with_transport(selector, TransportConfig::default())
+    }
+
+    pub fn open_selected_with_transport(
+        selector: &BoardSelector,
+        transport: TransportConfig,
+    ) -> Result<Self> {
         let mut usb = UsbDevice::with_transport_config(transport)?;
-        usb.open(constants::DW_VID, constants::DW_PID)?;
+        usb.open_selected(constants::DW_VID, constants::DW_PID, selector)?;
 
         let mut board = Self {
             usb,
@@ -707,6 +724,12 @@ impl<'a> IoSession<'a> {
 
     pub fn transfer_into(&mut self, tx: &[u16], rx: &mut [u16]) -> Result<()> {
         self.transfer(tx, rx)
+    }
+
+    pub fn transfer_frame(&mut self, tx: VeriCommFrame) -> Result<VeriCommFrame> {
+        let mut rx = VeriCommFrame::ZERO;
+        self.transfer(tx.words(), rx.words_mut())?;
+        Ok(rx)
     }
 
     pub fn finish(mut self) -> Result<()> {
