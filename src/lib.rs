@@ -5,11 +5,11 @@
 //! hardware, then create dedicated sessions for I/O or programming.
 //!
 //! ```no_run
-//! use vlfd_rs::{Board, IoConfig, Result, VeriCommFrame};
+//! use vlfd_rs::{Board, IoConfig, Licence, Result, VeriCommFrame};
 //!
 //! fn main() -> Result<()> {
 //!     let mut board = Board::open()?;
-//!     let mut io = board.configure_io(&IoConfig::default())?;
+//!     let mut io = board.configure_io(&IoConfig::new(Licence::CustomerId(0x1234)))?;
 //!
 //!     let tx = VeriCommFrame::from_bits(0x1234);
 //!     let rx = io.transfer_frame(tx)?;
@@ -36,6 +36,7 @@ pub mod constants;
 mod config;
 mod error;
 mod frame;
+mod licence;
 mod program;
 mod session;
 mod usb;
@@ -43,6 +44,7 @@ mod usb;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use frame::VeriCommFrame;
+pub use licence::Licence;
 pub use program::{Programmer, load_bitfile, load_bitfile_from_reader};
 pub use session::{
     Board, BoardMode, IoConfig, IoSession, IoTransferWindow, ProgramSession, TransferStageProfile,

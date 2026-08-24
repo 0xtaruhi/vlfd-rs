@@ -1,6 +1,6 @@
 use std::{env, error::Error, process, thread, time::Duration};
 
-use vlfd_rs::{Board, IoConfig};
+use vlfd_rs::{Board, IoConfig, Licence};
 
 fn main() {
     if let Err(err) = real_main() {
@@ -16,6 +16,7 @@ fn real_main() -> Result<(), Box<dyn Error>> {
     let mut clock_high = 4u16;
     let mut clock_low = 4u16;
     let mut settle_ms = 0u64;
+    let mut customer_id = None;
 
     let mut args = env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -46,11 +47,20 @@ fn real_main() -> Result<(), Box<dyn Error>> {
                     .ok_or("missing value for --settle-ms")?
                     .parse()?
             }
+            "--customer-id" => {
+                let value = args.next().ok_or("missing value for --customer-id")?;
+                let digits = value
+                    .strip_prefix("0x")
+                    .or_else(|| value.strip_prefix("0X"))
+                    .unwrap_or(&value);
+                customer_id = Some(u16::from_str_radix(digits, 16)?);
+            }
             other => return Err(format!("unknown flag `{other}`").into()),
         }
     }
 
     let tx = vec![0x1234u16; words];
+    let customer_id = customer_id.ok_or("missing required --customer-id HEX")?;
 
     for iteration in 0..iterations {
         println!("iter={iteration} phase=open");
@@ -65,7 +75,7 @@ fn real_main() -> Result<(), Box<dyn Error>> {
         let mut io = board.configure_io(&IoConfig {
             clock_high_delay: clock_high,
             clock_low_delay: clock_low,
-            ..IoConfig::default()
+            ..IoConfig::new(Licence::CustomerId(customer_id))
         })?;
 
         {
