@@ -795,10 +795,6 @@ impl<'session, 'board> IoTransferWindow<'session, 'board> {
         let mut profiler = TransferProfiler::borrow(profile);
 
         let stage_started = Instant::now();
-        self.reclaim_write_buffer()?;
-        profiler.add(TransferProfileStage::WaitWrite, stage_started.elapsed());
-
-        let stage_started = Instant::now();
         let Completion {
             buffer: read_buffer,
             actual_len,
@@ -809,6 +805,13 @@ impl<'session, 'board> IoTransferWindow<'session, 'board> {
             return Err(transfer_error(err, "pipeline_read"));
         }
         profiler.add(TransferProfileStage::WaitRead, stage_started.elapsed());
+
+        // Drain the device's response before waiting for the matching OUT
+        // transfer. Full-FIFO rolling windows can otherwise deadlock when the
+        // device needs IN-side progress before it can complete another write.
+        let stage_started = Instant::now();
+        self.reclaim_write_buffer()?;
+        profiler.add(TransferProfileStage::WaitWrite, stage_started.elapsed());
 
         let stage_started = Instant::now();
         if actual_len < self.frame_bytes {
